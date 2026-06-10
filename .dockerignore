@@ -1,0 +1,11 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+build/
+dist/
+*.o
+miner
+core
+core.*

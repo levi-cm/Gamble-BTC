@@ -1,0 +1,30 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Build outputs
+miner
+*.o
+*.so
+*.a
+build/
+dist/
+
+# Runtime/log output
+*.log
+logs/
+core
+core.*
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+tmp/
+*.tmp
