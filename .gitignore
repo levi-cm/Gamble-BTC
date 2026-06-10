@@ -14,6 +14,7 @@ dist/
 # Runtime/log output
 *.log
 logs/
+bench-results/
 core
 core.*
 

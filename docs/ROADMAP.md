@@ -4,6 +4,10 @@ This project is not ready for broad open-source release yet. The immediate goal
 is to document and preserve the current working container while preparing for a
 larger hardware-support push.
 
+Scope boundary: Gamble BTC is an iGPU miner, not a CPU miner. CPU nonce-search
+backends are intentionally out of scope because the project is meant to run
+mining work on integrated GPUs with low CPU load.
+
 ## Phase 1: Repository Readiness
 
 - Add safe ignore rules for local wallet/runtime configuration.
@@ -14,6 +18,9 @@ larger hardware-support push.
 ## Phase 2: Hardware Support Matrix
 
 Track integrated GPU support explicitly instead of implying portability.
+
+Status: started. `docs/HARDWARE_MATRIX.md` now records the verified HD 4600 GLES
+path and separates expected future support from verified support.
 
 Initial targets to investigate:
 
@@ -34,14 +41,18 @@ Each target should record:
 
 ## Phase 3: Runtime Generalization
 
-- Add a GPU capability probe before mining starts.
-- Make device paths and group handling configurable.
+- Add a GPU capability probe before mining starts. (Started: `GBTC_PROBE_ONLY=1`
+  reports Vulkan/GLES/OpenCL availability, with GLES implemented.)
+- Make device paths and group handling configurable. (Started:
+  `GBTC_DEVICE=/dev/dri/renderD128`; Compose remains host-specific for groups.)
 - Provide separate Compose examples for tested hardware families.
 - Avoid changing the known Intel HD 4600 path until replacement coverage exists.
 
 ## Phase 4: Testing and Release Prep
 
-- Add deterministic CPU-side tests for hash and Stratum helpers.
+- Add deterministic helper tests for hash and backend-selection helpers.
+- Add repeatable GLES benchmark scripts and record HD 4600 local-size/kernel
+  results before changing defaults.
 - Add container build checks in CI.
 - Add hardware-gated smoke-test documentation.
 - Review README claims against the verified support matrix before publishing.

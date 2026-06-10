@@ -5,6 +5,7 @@
 !.env.example
 build/
 dist/
+bench-results/
 *.o
 miner
 core

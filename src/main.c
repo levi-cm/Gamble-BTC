@@ -2,9 +2,13 @@
 // Path: EGL surfaceless + GLES 3.2 compute shader (Mesa crocus driver)
 // Pool: stratum+tcp (public-pool.io)
 //
-// Single-file C, ~700 lines. Educational. NOT optimized for max hashrate.
+// Educational. NOT optimized for max hashrate.
 
 #define _GNU_SOURCE
+#include "bench.h"
+#include "backend.h"
+#include "gles_tuning.h"
+
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl32.h>
@@ -17,11 +21,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdbool.h>
 #include <time.h>
@@ -33,7 +39,8 @@
 #define DIE(fmt, ...) do { LOG("FATAL " fmt, ##__VA_ARGS__); exit(1); } while(0)
 
 // ============================================================================
-// SHA-256 reference (CPU side, used for midstate + coinbase + merkle)
+// Host-side SHA-256 helpers used only for work construction and tests.
+// Mining work is intentionally dispatched to iGPU backends, not a CPU backend.
 // ============================================================================
 static const uint32_t K256[64] = {
     0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
@@ -133,244 +140,8 @@ static void bin_to_hex(char *out, const uint8_t *in, size_t bytes) {
     out[2*bytes] = 0;
 }
 
-// ============================================================================
-// GLSL compute shader for sha256d nonce search
-// ============================================================================
-// Original sliding-W shader kept for reference. Replaced by build_kernel_src() below
-// which generates a fully-unrolled version with all named uint w0..w15 + literal K constants.
-static const char *kernel_src_unused =
-    "#version 320 es\n"
-    "layout(local_size_x = 64) in;\n"
-    "layout(std430, binding = 0) readonly buffer In {\n"
-    "  uint midstate[8];\n"
-    "  uint w0; uint w1; uint w2;\n"
-    "  uint nonce_base;\n"
-    "  uint pad[3];\n"
-    "} I;\n"
-    "layout(std430, binding = 1) buffer Out {\n"
-    "  uint count;\n"
-    "  uint nonces[15];\n"
-    "} O;\n"
-    "const uint K[64] = uint[64](\n"
-    " 0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,\n"
-    " 0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,\n"
-    " 0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,\n"
-    " 0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,\n"
-    " 0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,\n"
-    " 0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,\n"
-    " 0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,\n"
-    " 0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u);\n"
-    "#define ROR(x,n) (((x)>>(n))|((x)<<(32u-(n))))\n"
-    "#define BIGSIG0(x) (ROR(x,2u)^ROR(x,13u)^ROR(x,22u))\n"
-    "#define BIGSIG1(x) (ROR(x,6u)^ROR(x,11u)^ROR(x,25u))\n"
-    "#define SMALLSIG0(x) (ROR(x,7u)^ROR(x,18u)^((x)>>3u))\n"
-    "#define SMALLSIG1(x) (ROR(x,17u)^ROR(x,19u)^((x)>>10u))\n"
-    "#define CH(x,y,z) (((x)&(y))^(~(x)&(z)))\n"
-    "#define MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))\n"
-    "void main() {\n"
-    "  uint global_idx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x);\n"
-    "  uint nonce = I.nonce_base + global_idx;\n"
-    "  uint W[16];\n"
-    "  // ---- First SHA: continue from midstate, second 64-byte block ----\n"
-    "  W[0]=I.w0; W[1]=I.w1; W[2]=I.w2; W[3]=nonce;\n"
-    "  W[4]=0x80000000u;\n"
-    "  W[5]=0u; W[6]=0u; W[7]=0u; W[8]=0u; W[9]=0u; W[10]=0u; W[11]=0u; W[12]=0u; W[13]=0u; W[14]=0u;\n"
-    "  W[15]=640u;\n"
-    "  uint a=I.midstate[0], b=I.midstate[1], c=I.midstate[2], d=I.midstate[3];\n"
-    "  uint e=I.midstate[4], f=I.midstate[5], g=I.midstate[6], h=I.midstate[7];\n"
-    "  uint t1, t2;\n"
-    "  for (int t = 0; t < 16; t++) {\n"
-    "    t1 = h + BIGSIG1(e) + CH(e,f,g) + K[t] + W[t];\n"
-    "    t2 = BIGSIG0(a) + MAJ(a,b,c);\n"
-    "    h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;\n"
-    "  }\n"
-    "  for (int t = 16; t < 64; t++) {\n"
-    "    int i15=(t-15)&15, i2=(t-2)&15, i7=(t-7)&15, i16=(t-16)&15, i0=t&15;\n"
-    "    uint w15=W[i15], w2=W[i2];\n"
-    "    uint wt = W[i16] + SMALLSIG0(w15) + W[i7] + SMALLSIG1(w2);\n"
-    "    W[i0] = wt;\n"
-    "    t1 = h + BIGSIG1(e) + CH(e,f,g) + K[t] + wt;\n"
-    "    t2 = BIGSIG0(a) + MAJ(a,b,c);\n"
-    "    h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;\n"
-    "  }\n"
-    "  uint h0=I.midstate[0]+a, h1=I.midstate[1]+b, h2=I.midstate[2]+c, h3=I.midstate[3]+d;\n"
-    "  uint h4=I.midstate[4]+e, h5=I.midstate[5]+f, h6=I.midstate[6]+g, h7=I.midstate[7]+h;\n"
-    "  // ---- Second SHA: hash 32-byte first hash, padded to 64 ----\n"
-    "  W[0]=h0; W[1]=h1; W[2]=h2; W[3]=h3; W[4]=h4; W[5]=h5; W[6]=h6; W[7]=h7;\n"
-    "  W[8]=0x80000000u; W[9]=0u; W[10]=0u; W[11]=0u; W[12]=0u; W[13]=0u; W[14]=0u;\n"
-    "  W[15]=256u;\n"
-    "  a=0x6a09e667u; b=0xbb67ae85u; c=0x3c6ef372u; d=0xa54ff53au;\n"
-    "  e=0x510e527fu; f=0x9b05688cu; g=0x1f83d9abu; h=0x5be0cd19u;\n"
-    "  for (int t = 0; t < 16; t++) {\n"
-    "    t1 = h + BIGSIG1(e) + CH(e,f,g) + K[t] + W[t];\n"
-    "    t2 = BIGSIG0(a) + MAJ(a,b,c);\n"
-    "    h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;\n"
-    "  }\n"
-    "  for (int t = 16; t < 64; t++) {\n"
-    "    int i15=(t-15)&15, i2=(t-2)&15, i7=(t-7)&15, i16=(t-16)&15, i0=t&15;\n"
-    "    uint w15=W[i15], w2=W[i2];\n"
-    "    uint wt = W[i16] + SMALLSIG0(w15) + W[i7] + SMALLSIG1(w2);\n"
-    "    W[i0] = wt;\n"
-    "    t1 = h + BIGSIG1(e) + CH(e,f,g) + K[t] + wt;\n"
-    "    t2 = BIGSIG0(a) + MAJ(a,b,c);\n"
-    "    h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;\n"
-    "  }\n"
-    "  uint final_h7 = 0x5be0cd19u + h;\n"
-    "  if (final_h7 == 0u) {\n"
-    "    uint idx = atomicAdd(O.count, 1u);\n"
-    "    if (idx < 15u) O.nonces[idx] = nonce;\n"
-    "  }\n"
-    "}\n";
-
-// ---- Fully-unrolled shader generator ----
-// Emits 128 round expressions (64 first-SHA + 64 second-SHA) inline with named
-// uint w0..w15 vars and literal K constants. No dynamic indexing → Mesa can register-allocate.
-static const uint32_t SHA_K[64] = {
-    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-};
-
-static void emit_round(char **p, const char *vars[8], int t, const char *wname) {
-    *p += sprintf(*p,
-        "  t1 = %s + BIGSIG1(%s) + CH(%s,%s,%s) + 0x%08xu + %s;\n"
-        "  t2 = BIGSIG0(%s) + MAJ(%s,%s,%s);\n"
-        "  %s = %s + t1; %s = t1 + t2;\n",
-        vars[7], vars[4], vars[4], vars[5], vars[6], SHA_K[t], wname,
-        vars[0], vars[0], vars[1], vars[2],
-        vars[3], vars[3], vars[7]);
-    // Rotate vars: a=t1+t2, b=a, c=b, ..., h=g
-    // After the round: new a=t1+t2 (stored in vars[7] var), new e=d+t1 (stored in vars[3])
-    // Variable rotation: shift via name swap by caller
-}
-
-static char* build_kernel_src(void) {
-    static char buf[262144];
-    char *p = buf;
-    p += sprintf(p,
-        "#version 320 es\n"
-        "layout(local_size_x = 64) in;\n"
-        "layout(std430, binding = 0) readonly buffer In {\n"
-        "  uint midstate[8];\n"
-        "  uint w0_in; uint w1_in; uint w2_in;\n"
-        "  uint nonce_base;\n"
-        "  uint pad[3];\n"
-        "} I;\n"
-        "layout(std430, binding = 1) buffer Out {\n"
-        "  uint count;\n"
-        "  uint nonces[15];\n"
-        "} O;\n"
-        "#define ROR(x,n) (((x)>>(n))|((x)<<(32u-(n))))\n"
-        "#define BIGSIG0(x) (ROR(x,2u)^ROR(x,13u)^ROR(x,22u))\n"
-        "#define BIGSIG1(x) (ROR(x,6u)^ROR(x,11u)^ROR(x,25u))\n"
-        "#define SMALLSIG0(x) (ROR(x,7u)^ROR(x,18u)^((x)>>3u))\n"
-        "#define SMALLSIG1(x) (ROR(x,17u)^ROR(x,19u)^((x)>>10u))\n"
-        "#define CH(x,y,z) (((x)&(y))^(~(x)&(z)))\n"
-        "#define MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))\n"
-        "void main() {\n"
-        "  uint global_idx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x);\n"
-        "  uint nonce = I.nonce_base + global_idx;\n"
-        "  uint t1, t2;\n"
-        "  uint w0 = I.w0_in;\n"
-        "  uint w1 = I.w1_in;\n"
-        "  uint w2 = I.w2_in;\n"
-        "  uint w3 = nonce;\n"
-        "  uint w4 = 0x80000000u;\n"
-        "  uint w5 = 0u; uint w6 = 0u; uint w7 = 0u; uint w8 = 0u;\n"
-        "  uint w9 = 0u; uint w10 = 0u; uint w11 = 0u; uint w12 = 0u;\n"
-        "  uint w13 = 0u; uint w14 = 0u; uint w15 = 640u;\n"
-        "  uint a = I.midstate[0]; uint b = I.midstate[1]; uint c = I.midstate[2]; uint d = I.midstate[3];\n"
-        "  uint e = I.midstate[4]; uint f = I.midstate[5]; uint g = I.midstate[6]; uint h = I.midstate[7];\n");
-
-    const char *wnames[16] = {"w0","w1","w2","w3","w4","w5","w6","w7","w8","w9","w10","w11","w12","w13","w14","w15"};
-
-    {
-        const char *v[8] = {"a","b","c","d","e","f","g","h"};
-        for (int t = 0; t < 64; t++) {
-            const char *wt;
-            if (t < 16) wt = wnames[t];
-            else {
-                int s = t & 15;
-                int s2 = (t-2) & 15;
-                int s7 = (t-7) & 15;
-                int s15 = (t-15) & 15;
-                p += sprintf(p, "  %s = %s + SMALLSIG0(%s) + %s + SMALLSIG1(%s);\n",
-                             wnames[s], wnames[s], wnames[s15], wnames[s7], wnames[s2]);
-                wt = wnames[s];
-            }
-            p += sprintf(p,
-                "  t1 = %s + BIGSIG1(%s) + CH(%s,%s,%s) + 0x%08xu + %s;\n"
-                "  t2 = BIGSIG0(%s) + MAJ(%s,%s,%s);\n"
-                "  %s = %s + t1; %s = t1 + t2;\n",
-                v[7], v[4], v[4], v[5], v[6], SHA_K[t], wt,
-                v[0], v[0], v[1], v[2],
-                v[3], v[3], v[7]);
-            const char *na = v[7], *ne = v[3];
-            v[7] = v[6]; v[6] = v[5]; v[5] = v[4]; v[4] = ne;
-            v[3] = v[2]; v[2] = v[1]; v[1] = v[0]; v[0] = na;
-        }
-        p += sprintf(p,
-            "  uint h1_0 = I.midstate[0] + %s;\n"
-            "  uint h1_1 = I.midstate[1] + %s;\n"
-            "  uint h1_2 = I.midstate[2] + %s;\n"
-            "  uint h1_3 = I.midstate[3] + %s;\n"
-            "  uint h1_4 = I.midstate[4] + %s;\n"
-            "  uint h1_5 = I.midstate[5] + %s;\n"
-            "  uint h1_6 = I.midstate[6] + %s;\n"
-            "  uint h1_7 = I.midstate[7] + %s;\n",
-            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
-    }
-
-    p += sprintf(p,
-        "  w0 = h1_0; w1 = h1_1; w2 = h1_2; w3 = h1_3;\n"
-        "  w4 = h1_4; w5 = h1_5; w6 = h1_6; w7 = h1_7;\n"
-        "  w8 = 0x80000000u; w9 = 0u; w10 = 0u; w11 = 0u;\n"
-        "  w12 = 0u; w13 = 0u; w14 = 0u; w15 = 256u;\n"
-        "  a = 0x6a09e667u; b = 0xbb67ae85u; c = 0x3c6ef372u; d = 0xa54ff53au;\n"
-        "  e = 0x510e527fu; f = 0x9b05688cu; g = 0x1f83d9abu; h = 0x5be0cd19u;\n");
-
-    {
-        const char *v[8] = {"a","b","c","d","e","f","g","h"};
-        for (int t = 0; t < 64; t++) {
-            const char *wt;
-            if (t < 16) wt = wnames[t];
-            else {
-                int s = t & 15;
-                int s2 = (t-2) & 15;
-                int s7 = (t-7) & 15;
-                int s15 = (t-15) & 15;
-                p += sprintf(p, "  %s = %s + SMALLSIG0(%s) + %s + SMALLSIG1(%s);\n",
-                             wnames[s], wnames[s], wnames[s15], wnames[s7], wnames[s2]);
-                wt = wnames[s];
-            }
-            p += sprintf(p,
-                "  t1 = %s + BIGSIG1(%s) + CH(%s,%s,%s) + 0x%08xu + %s;\n"
-                "  t2 = BIGSIG0(%s) + MAJ(%s,%s,%s);\n"
-                "  %s = %s + t1; %s = t1 + t2;\n",
-                v[7], v[4], v[4], v[5], v[6], SHA_K[t], wt,
-                v[0], v[0], v[1], v[2],
-                v[3], v[3], v[7]);
-            const char *na = v[7], *ne = v[3];
-            v[7] = v[6]; v[6] = v[5]; v[5] = v[4]; v[4] = ne;
-            v[3] = v[2]; v[2] = v[1]; v[1] = v[0]; v[0] = na;
-        }
-        p += sprintf(p,
-            "  uint final_h7 = 0x5be0cd19u + %s;\n"
-            "  if (final_h7 == 0u) {\n"
-            "    uint idx = atomicAdd(O.count, 1u);\n"
-            "    if (idx < 15u) O.nonces[idx] = nonce;\n"
-            "  }\n"
-            "}\n",
-            v[7]);
-    }
-
-    return buf;
-}
+// GLES shader generation lives in src/gles_tuning.c so parser and source
+// variants can be tested without EGL/GLES development headers.
 
 // ============================================================================
 // Forward decls for live-stats globals (defined further below)
@@ -688,10 +459,20 @@ static EGLDisplay egl_dpy;
 static EGLContext egl_ctx;
 static GLuint compute_prog;
 static GLuint ssbo_in, ssbo_out;
+static GLint gles_max_groups[3];
+static gbtc_gles_config_t gles_config;
+
+static char g_backend[32] = "unknown";
+static char g_backend_api[32] = "none";
+static char g_device_path[128] = "";
+static char g_device_vendor[128] = "";
+static char g_device_name[256] = "";
+static char g_driver_name[256] = "";
+static char g_fallback_reason[256] = "";
 
 typedef struct {
     uint32_t midstate[8];
-    uint32_t w0, w1, w2;
+    uint32_t tail3[3];
     uint32_t nonce_base;
     uint32_t pad[3];
 } shader_in_t;
@@ -701,44 +482,176 @@ typedef struct {
     uint32_t nonces[15];
 } shader_out_t;
 
-static void gl_init(void) {
+static void set_reason(char *reason, size_t reason_cap, const char *fmt, ...)
+{
+    if (!reason || reason_cap == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(reason, reason_cap, fmt, ap);
+    va_end(ap);
+}
+
+static void copy_gl_string(char *dst, size_t cap, GLenum name)
+{
+    const GLubyte *s = glGetString(name);
+    snprintf(dst, cap, "%s", s ? (const char *)s : "unknown");
+}
+
+static void gles_destroy(void)
+{
+    if (ssbo_in) {
+        glDeleteBuffers(1, &ssbo_in);
+        ssbo_in = 0;
+    }
+    if (ssbo_out) {
+        glDeleteBuffers(1, &ssbo_out);
+        ssbo_out = 0;
+    }
+    if (compute_prog) {
+        glDeleteProgram(compute_prog);
+        compute_prog = 0;
+    }
+    if (egl_dpy && egl_dpy != EGL_NO_DISPLAY) {
+        if (egl_ctx && egl_ctx != EGL_NO_CONTEXT) {
+            eglDestroyContext(egl_dpy, egl_ctx);
+            egl_ctx = EGL_NO_CONTEXT;
+        }
+        eglTerminate(egl_dpy);
+        egl_dpy = EGL_NO_DISPLAY;
+    }
+}
+
+static int gles_create_context(char *reason, size_t reason_cap)
+{
+    const char *device = getenv("GBTC_DEVICE");
+    if (!device || !device[0]) device = "/dev/dri/renderD128";
+    snprintf(g_device_path, sizeof(g_device_path), "%s", device);
+    if (access(device, R_OK | W_OK) != 0) {
+        set_reason(reason, reason_cap, "%s is not accessible: %s", device, strerror(errno));
+        return -1;
+    }
+
     PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
         (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
-    if (!eglGetPlatformDisplayEXT) DIE("no eglGetPlatformDisplayEXT");
+    if (!eglGetPlatformDisplayEXT) {
+        set_reason(reason, reason_cap, "no eglGetPlatformDisplayEXT");
+        return -1;
+    }
     egl_dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
-    if (egl_dpy == EGL_NO_DISPLAY) DIE("eglGetPlatformDisplay");
+    if (egl_dpy == EGL_NO_DISPLAY) {
+        set_reason(reason, reason_cap, "eglGetPlatformDisplay failed");
+        return -1;
+    }
     EGLint maj, min;
-    if (!eglInitialize(egl_dpy, &maj, &min)) DIE("eglInitialize");
+    if (!eglInitialize(egl_dpy, &maj, &min)) {
+        set_reason(reason, reason_cap, "eglInitialize failed: 0x%x", eglGetError());
+        gles_destroy();
+        return -1;
+    }
     LOG("EGL %d.%d %s", maj, min, eglQueryString(egl_dpy, EGL_VENDOR));
-    if (!eglBindAPI(EGL_OPENGL_ES_API)) DIE("eglBindAPI");
+    if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+        set_reason(reason, reason_cap, "eglBindAPI(EGL_OPENGL_ES_API) failed: 0x%x", eglGetError());
+        gles_destroy();
+        return -1;
+    }
     EGLint cattr[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 2, EGL_NONE };
     egl_ctx = eglCreateContext(egl_dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, cattr);
-    if (egl_ctx == EGL_NO_CONTEXT) DIE("eglCreateContext 0x%x", eglGetError());
-    if (!eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_ctx)) DIE("eglMakeCurrent");
+    if (egl_ctx == EGL_NO_CONTEXT) {
+        set_reason(reason, reason_cap, "eglCreateContext GLES 3.2 failed: 0x%x", eglGetError());
+        gles_destroy();
+        return -1;
+    }
+    if (!eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_ctx)) {
+        set_reason(reason, reason_cap, "eglMakeCurrent failed: 0x%x", eglGetError());
+        gles_destroy();
+        return -1;
+    }
+    copy_gl_string(g_device_vendor, sizeof(g_device_vendor), GL_VENDOR);
+    copy_gl_string(g_device_name, sizeof(g_device_name), GL_RENDERER);
+    copy_gl_string(g_driver_name, sizeof(g_driver_name), GL_VERSION);
+    for (int i = 0; i < 3; i++) glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT, i, &gles_max_groups[i]);
     LOG("GL: %s | %s | %s", glGetString(GL_VENDOR), glGetString(GL_RENDERER), glGetString(GL_VERSION));
+    return 0;
+}
 
-    char *generated = build_kernel_src();
-    LOG("shader src: %zu bytes", strlen(generated));
+static int gles_compile_compute(const char *src, GLuint *program, char *reason, size_t reason_cap)
+{
     GLuint sh = glCreateShader(GL_COMPUTE_SHADER);
-    const char *src_ptr = generated;
-    glShaderSource(sh, 1, &src_ptr, NULL);
+    if (!sh) {
+        set_reason(reason, reason_cap, "glCreateShader(GL_COMPUTE_SHADER) failed");
+        return -1;
+    }
+    glShaderSource(sh, 1, &src, NULL);
     glCompileShader(sh);
     GLint ok;
     glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
     if (!ok) {
-        char log[8192]; GLsizei n;
+        char log[8192]; GLsizei n = 0;
         glGetShaderInfoLog(sh, sizeof(log), &n, log);
-        DIE("shader compile:\n%.*s", n, log);
+        set_reason(reason, reason_cap, "compute shader compile failed: %.*s", n, log);
+        glDeleteShader(sh);
+        return -1;
     }
-    compute_prog = glCreateProgram();
-    glAttachShader(compute_prog, sh);
-    glLinkProgram(compute_prog);
-    glGetProgramiv(compute_prog, GL_LINK_STATUS, &ok);
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, sh);
+    glLinkProgram(prog);
+    glDeleteShader(sh);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
     if (!ok) {
-        char log[8192]; GLsizei n;
-        glGetProgramInfoLog(compute_prog, sizeof(log), &n, log);
-        DIE("program link:\n%.*s", n, log);
+        char log[8192]; GLsizei n = 0;
+        glGetProgramInfoLog(prog, sizeof(log), &n, log);
+        set_reason(reason, reason_cap, "compute program link failed: %.*s", n, log);
+        glDeleteProgram(prog);
+        return -1;
     }
+    *program = prog;
+    return 0;
+}
+
+static int gles_probe(char *reason, size_t reason_cap)
+{
+    static const char *probe_src =
+        "#version 320 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "void main(){}\n";
+    GLuint probe_prog = 0;
+    if (gles_create_context(reason, reason_cap) != 0) return -1;
+    int rc = gles_compile_compute(probe_src, &probe_prog, reason, reason_cap);
+    if (probe_prog) glDeleteProgram(probe_prog);
+    if (rc == 0) {
+        set_reason(reason, reason_cap, "%s / %s / %s",
+                   g_device_vendor, g_device_name, g_driver_name);
+    }
+    gles_destroy();
+    return rc;
+}
+
+static int gles_init(char *reason, size_t reason_cap)
+{
+    if (gbtc_gles_config_from_env(&gles_config, reason, reason_cap) != 0) {
+        return -1;
+    }
+    if (gles_create_context(reason, reason_cap) != 0) return -1;
+
+    char *generated = gbtc_gles_build_kernel_src(&gles_config, reason, reason_cap);
+    if (!generated) {
+        gles_destroy();
+        return -1;
+    }
+    size_t generated_len = strlen(generated);
+    LOG("shader compile: kernel=%s local_size=%u src_bytes=%zu renderer=\"%s\" gl=\"%s\"",
+        gbtc_gles_kernel_name(gles_config.kernel), gles_config.local_size,
+        generated_len, g_device_name, g_driver_name);
+    if (gles_compile_compute(generated, &compute_prog, reason, reason_cap) != 0) {
+        LOG("shader compile failed: kernel=%s local_size=%u reason=%s",
+            gbtc_gles_kernel_name(gles_config.kernel), gles_config.local_size, reason);
+        free(generated);
+        gles_destroy();
+        return -1;
+    }
+    LOG("shader compile ok: kernel=%s local_size=%u src_bytes=%zu",
+        gbtc_gles_kernel_name(gles_config.kernel), gles_config.local_size, generated_len);
+    free(generated);
 
     glGenBuffers(1, &ssbo_in);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_in);
@@ -750,8 +663,81 @@ static void gl_init(void) {
     glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(shader_out_t), NULL, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_out);
 
-    LOG("GL pipeline ready");
+    set_reason(reason, reason_cap, "GLES pipeline ready on %s", g_device_name);
+    LOG("GL pipeline ready kernel=%s local_size=%u",
+        gbtc_gles_kernel_name(gles_config.kernel), gles_config.local_size);
+    return 0;
 }
+
+static int gles_run_batch(const gbtc_work_batch_t *work, gbtc_backend_result_t *result)
+{
+    if (!work || !result || work->nonce_count == 0) return -1;
+    uint32_t nonces_per_invocation = gbtc_gles_kernel_nonces_per_invocation(gles_config.kernel);
+    uint32_t dispatch_quantum = gles_config.local_size * nonces_per_invocation;
+    if ((work->nonce_count % dispatch_quantum) != 0) {
+        LOG("gles: nonce_count=%u is not divisible by dispatch quantum %u (local_size=%u nonces_per_invocation=%u)",
+            work->nonce_count, dispatch_quantum, gles_config.local_size, nonces_per_invocation);
+        return -1;
+    }
+
+    uint32_t invocations = work->nonce_count / nonces_per_invocation;
+    uint32_t groups = invocations / gles_config.local_size;
+    uint32_t wgx = groups < 256u ? groups : 256u;
+    while (wgx > 1 && (groups % wgx) != 0) wgx--;
+    uint32_t wgy = groups / wgx;
+    if (gles_max_groups[0] > 0 && (GLint)wgx > gles_max_groups[0]) {
+        LOG("gles: dispatch x=%u exceeds device limit %d", wgx, gles_max_groups[0]);
+        return -1;
+    }
+    if (gles_max_groups[1] > 0 && (GLint)wgy > gles_max_groups[1]) {
+        LOG("gles: dispatch y=%u exceeds device limit %d", wgy, gles_max_groups[1]);
+        return -1;
+    }
+
+    shader_out_t out_init = {0};
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_out);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(out_init), &out_init);
+
+    shader_in_t in = {0};
+    memcpy(in.midstate, work->midstate, sizeof(in.midstate));
+    memcpy(in.tail3, work->tail3, sizeof(in.tail3));
+    in.nonce_base = work->nonce_base;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_in);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(in), &in);
+
+    glUseProgram(compute_prog);
+    glDispatchCompute(wgx, wgy, 1);
+    GLenum derr = glGetError();
+    if (derr != GL_NO_ERROR) {
+        LOG("dispatch err 0x%x", derr);
+        return -1;
+    }
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    glFinish();
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_out);
+    shader_out_t *res = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(shader_out_t), GL_MAP_READ_BIT);
+    if (!res) {
+        LOG("glMapBufferRange err 0x%x", glGetError());
+        return -1;
+    }
+    result->count = res->count;
+    if (result->count > GBTC_MAX_FOUND_NONCES) result->count = GBTC_MAX_FOUND_NONCES;
+    for (uint32_t i = 0; i < result->count; i++) result->nonces[i] = res->nonces[i];
+    result->hashes_done = work->nonce_count;
+    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    return 0;
+}
+
+const gbtc_backend_t gbtc_gles_backend = {
+    .kind = GBTC_BACKEND_GLES,
+    .name = "gles",
+    .api = "gles",
+    .probe = gles_probe,
+    .init = gles_init,
+    .run_batch = gles_run_batch,
+    .shutdown = gles_destroy,
+};
 
 // ============================================================================
 // Main loop
@@ -850,6 +836,9 @@ static int build_stats_json(char *buf, size_t cap, bool include_history) {
         "\"uptime\":%ld,\"submitted\":%llu,\"accepted\":%llu,\"rejected\":%llu,"
         "\"lifetime_hashes\":%llu,\"diff\":%.6f,\"job\":\"%s\",\"ntime\":%u,"
         "\"nbits\":%u,\"merkle_branches\":%d,\"pool\":\"%s\",\"worker\":\"%s\",\"addr\":\"%s\","
+        "\"backend\":\"%s\",\"backend_api\":\"%s\",\"device_path\":\"%s\","
+        "\"device_vendor\":\"%s\",\"device_name\":\"%s\",\"driver_name\":\"%s\","
+        "\"fallback_reason\":\"%s\","
         "\"net_diff\":%.6e,\"net_hashrate\":%.6e,\"eta_block_s\":%.6e,"
         "\"prob_block_per_day\":%.6e,\"prob_block_24h\":%.6e",
         g_last_mh, g_min_mh, g_max_mh, g_avg_mh, m_count,
@@ -857,6 +846,8 @@ static int build_stats_json(char *buf, size_t cap, bool include_history) {
         (unsigned long long)g_rejected, (unsigned long long)g_lifetime_hashes,
         g_current_diff, g_current_job, g_current_ntime, g_current_nbits,
         g_merkle_branches, g_pool_url, g_worker, g_btc_addr,
+        g_backend, g_backend_api, g_device_path, g_device_vendor, g_device_name,
+        g_driver_name, g_fallback_reason,
         net_diff, net_hashrate, eta_block_s, prob_per_day, prob_24h);
     if (include_history && n > 0 && (size_t)n < cap) {
         n += snprintf(buf + n, cap - n, ",\"history\":[");
@@ -868,6 +859,8 @@ static int build_stats_json(char *buf, size_t cap, bool include_history) {
         if ((size_t)n < cap) n += snprintf(buf + n, cap - n, "]");
     }
     if ((size_t)n < cap) n += snprintf(buf + n, cap - n, "}");
+    if (n < 0) n = 0;
+    if (cap > 0 && (size_t)n >= cap) n = (int)cap - 1;
     pthread_mutex_unlock(&m_mu);
     return n;
 }
@@ -921,6 +914,13 @@ static const char *index_html =
     "<div class=cell><div class=k>pool</div><div class=v sm id=f_pool>-</div></div>"
     "<div class=cell><div class=k>worker</div><div class=v sm id=f_w>-</div></div>"
     "<div class=cell><div class=k>btc address</div><div class=v sm id=f_a>-</div></div>"
+    "<div class=cell><div class=k>backend</div><div class=v id=f_backend>-</div></div>"
+    "<div class=cell><div class=k>backend api</div><div class=v id=f_backend_api>-</div></div>"
+    "<div class=cell><div class=k>device path</div><div class=v sm id=f_device_path>-</div></div>"
+    "<div class=cell><div class=k>device vendor</div><div class=v sm id=f_device_vendor>-</div></div>"
+    "<div class=cell><div class=k>device name</div><div class=v sm id=f_device_name>-</div></div>"
+    "<div class=cell><div class=k>driver</div><div class=v sm id=f_driver_name>-</div></div>"
+    "<div class=cell><div class=k>fallback reason</div><div class=v sm id=f_fallback_reason>-</div></div>"
     "<div class=cell><div class=k>network difficulty</div><div class=v id=f_nd>-</div></div>"
     "<div class=cell><div class=k>network hashrate</div><div class=v id=f_nh>-</div></div>"
     "<div class=cell><div class=k>your share of net</div><div class=v id=f_share>-</div></div>"
@@ -991,6 +991,13 @@ static const char *index_html =
     "if(o.pool)$('f_pool').textContent=o.pool;"
     "if(o.worker)$('f_w').textContent=o.worker;"
     "if(o.addr)$('f_a').textContent=o.addr;"
+    "if(o.backend)$('f_backend').textContent=o.backend;"
+    "if(o.backend_api)$('f_backend_api').textContent=o.backend_api;"
+    "if(o.device_path)$('f_device_path').textContent=o.device_path;"
+    "if(o.device_vendor)$('f_device_vendor').textContent=o.device_vendor;"
+    "if(o.device_name)$('f_device_name').textContent=o.device_name;"
+    "if(o.driver_name)$('f_driver_name').textContent=o.driver_name;"
+    "if(o.fallback_reason)$('f_fallback_reason').textContent=o.fallback_reason;"
     "if(o.net_diff!=null)$('f_nd').textContent=o.net_diff>0?fmt(o.net_diff)+' ('+o.net_diff.toExponential(3)+')':'-';"
     "if(o.net_hashrate!=null)$('f_nh').textContent=o.net_hashrate>0?fmt(o.net_hashrate)+'H/s':'-';"
     "if(o.net_hashrate>0&&o.mh>0){const sh=o.mh*1e6/o.net_hashrate;$('f_share').textContent=fmtPct(sh);}"
@@ -1048,7 +1055,7 @@ static void *sse_client_thread(void *arg) {
         while (m_seq == seen) pthread_cond_wait(&m_cv, &m_mu);
         seen = m_seq;
         pthread_mutex_unlock(&m_mu);
-        char line[2048];
+        char line[8192];
         int len = snprintf(line, sizeof(line), "data: ");
         len += build_stats_json(line + len, sizeof(line) - len, false);
         len += snprintf(line + len, sizeof(line) - len, "\n\n");
@@ -1057,6 +1064,46 @@ static void *sse_client_thread(void *arg) {
 out:
     close(fd);
     return NULL;
+}
+
+static bool http_path_is(const char *path, const char *want)
+{
+    size_t n = strlen(want);
+    return strncmp(path, want, n) == 0 && (path[n] == '\0' || path[n] == '?');
+}
+
+static bool http_path_is_index(const char *path)
+{
+    return http_path_is(path, "/") ||
+           http_path_is(path, "/index") ||
+           http_path_is(path, "/index.html");
+}
+
+static void http_send_body(int fd, const char *status, const char *content_type,
+                           const char *body, size_t body_len, bool send_body)
+{
+    char hdr[512];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        status, content_type, body_len);
+    write_all(fd, hdr, (size_t)hlen);
+    if (send_body && body_len > 0) write_all(fd, body, body_len);
+}
+
+static void http_send_empty(int fd, const char *status)
+{
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %s\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n", status);
+    write_all(fd, hdr, (size_t)hlen);
 }
 
 static void *http_thread(void *unused) {
@@ -1076,35 +1123,68 @@ static void *http_thread(void *unused) {
     if (listen(srv, 16) < 0) { LOG("http: listen fail"); close(srv); return NULL; }
     LOG("http: listening on 0.0.0.0:41174");
     while (!g_stop) {
-        int c = accept(srv, NULL, NULL);
+        struct sockaddr_in peer = {0};
+        socklen_t peer_len = sizeof(peer);
+        int c = accept(srv, (struct sockaddr*)&peer, &peer_len);
         if (c < 0) continue;
         // Read request line + headers (small, single recv)
         char req[2048];
         ssize_t n = recv(c, req, sizeof(req) - 1, 0);
         if (n <= 0) { close(c); continue; }
         req[n] = 0;
-        if (strncmp(req, "GET /events", 11) == 0 && (req[11] == ' ' || req[11] == '?')) {
+
+        char peer_ip[INET_ADDRSTRLEN] = "unknown";
+        inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
+
+        char method[8] = {0};
+        char path[256] = {0};
+        if (sscanf(req, "%7s %255s", method, path) != 2) {
+            LOG("http: malformed request from %s", peer_ip);
+            http_send_empty(c, "400 Bad Request");
+            close(c);
+            continue;
+        }
+
+        bool is_get = strcmp(method, "GET") == 0;
+        bool is_head = strcmp(method, "HEAD") == 0;
+        if (strcmp(method, "OPTIONS") == 0) {
+            const char *r =
+                "HTTP/1.1 204 No Content\r\n"
+                "Allow: GET, HEAD, OPTIONS\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n"
+                "Content-Length: 0\r\n"
+                "Connection: close\r\n"
+                "\r\n";
+            write_all(c, r, strlen(r));
+            close(c);
+        } else if (is_get && http_path_is(path, "/events")) {
             pthread_t t;
             if (pthread_create(&t, NULL, sse_client_thread, (void*)(intptr_t)c) == 0) {
                 pthread_detach(t);
             } else {
                 close(c);
             }
-        } else if (strncmp(req, "GET / ", 6) == 0 || strncmp(req, "GET /index", 10) == 0) {
-            char hdr[256];
-            int hlen = snprintf(hdr, sizeof(hdr),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n"
-                "Cache-Control: no-store\r\n"
-                "Connection: close\r\n"
-                "\r\n", strlen(index_html));
-            write_all(c, hdr, hlen);
-            write_all(c, index_html, strlen(index_html));
+        } else if ((is_get || is_head) && http_path_is(path, "/status.json")) {
+            char body[8192];
+            int blen = build_stats_json(body, sizeof(body), true);
+            http_send_body(c, "200 OK", "application/json",
+                           body, (size_t)blen, is_get);
+            close(c);
+        } else if ((is_get || is_head) && http_path_is_index(path)) {
+            http_send_body(c, "200 OK", "text/html; charset=utf-8",
+                           index_html, strlen(index_html), is_get);
+            close(c);
+        } else if ((is_get || is_head) && http_path_is(path, "/favicon.ico")) {
+            http_send_empty(c, "204 No Content");
+            close(c);
+        } else if (!is_get && !is_head) {
+            LOG("http: unsupported method from %s: %s %s", peer_ip, method, path);
+            http_send_empty(c, "405 Method Not Allowed");
             close(c);
         } else {
-            const char *r = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            write_all(c, r, strlen(r));
+            LOG("http: not found from %s: %s %s", peer_ip, method, path);
+            http_send_empty(c, "404 Not Found");
             close(c);
         }
     }
@@ -1112,9 +1192,377 @@ static void *http_thread(void *unused) {
     return NULL;
 }
 
+static int env_flag_enabled(const char *name)
+{
+    const char *v = getenv(name);
+    return v && (strcmp(v, "1") == 0 || strcmp(v, "true") == 0 ||
+                 strcmp(v, "yes") == 0 || strcmp(v, "on") == 0);
+}
+
+static uint32_t parse_batch_nonces(uint32_t dispatch_quantum)
+{
+    char reason[256] = "";
+    uint32_t value = 0;
+    if (gbtc_parse_batch_nonces_value(getenv("GBTC_BATCH_NONCES"), dispatch_quantum,
+                                      &value, reason, sizeof(reason)) != 0) {
+        DIE("%s", reason);
+    }
+    return value;
+}
+
+static const gbtc_backend_t *backend_for_kind(gbtc_backend_kind_t kind)
+{
+    switch (kind) {
+    case GBTC_BACKEND_GLES: return &gbtc_gles_backend;
+    case GBTC_BACKEND_VULKAN: return &gbtc_vulkan_backend;
+    case GBTC_BACKEND_OPENCL: return &gbtc_opencl_backend;
+    }
+    return NULL;
+}
+
+static void init_device_path_status(void)
+{
+    const char *device = getenv("GBTC_DEVICE");
+    if (!device || !device[0]) device = "/dev/dri/renderD128";
+    snprintf(g_device_path, sizeof(g_device_path), "%s", device);
+}
+
+static void set_selected_backend_status(const gbtc_backend_t *backend, const char *fallback_reason)
+{
+    snprintf(g_backend, sizeof(g_backend), "%s", backend ? backend->name : "unknown");
+    snprintf(g_backend_api, sizeof(g_backend_api), "%s", backend ? backend->api : "none");
+    snprintf(g_fallback_reason, sizeof(g_fallback_reason), "%s", fallback_reason ? fallback_reason : "");
+}
+
+static void append_rejection(char *dst, size_t cap, const char *backend, const char *reason)
+{
+    size_t used = strlen(dst);
+    if (used >= cap) return;
+    snprintf(dst + used, cap - used, "%s%s: %s", used ? "; " : "", backend, reason);
+}
+
+static const gbtc_backend_t *select_backend_or_die(const char *requested)
+{
+    const gbtc_backend_t *priority[] = {
+        &gbtc_vulkan_backend,
+        &gbtc_gles_backend,
+        &gbtc_opencl_backend,
+    };
+    char rejection_summary[512] = "";
+
+    if (gbtc_backend_is_auto(requested)) {
+        for (size_t i = 0; i < sizeof(priority) / sizeof(priority[0]); i++) {
+            char reason[512] = "";
+            const gbtc_backend_t *backend = priority[i];
+            if (backend->probe(reason, sizeof(reason)) == 0) {
+                LOG("backend probe: %s available (%s)", backend->name, reason);
+                set_selected_backend_status(backend, rejection_summary);
+                return backend;
+            }
+            LOG("backend probe: %s rejected (%s)", backend->name, reason);
+            append_rejection(rejection_summary, sizeof(rejection_summary), backend->name, reason);
+        }
+        DIE("no usable iGPU backend found (%s)", rejection_summary);
+    }
+
+    gbtc_backend_kind_t kind;
+    if (gbtc_parse_backend_kind(requested, &kind) != 0) {
+        DIE("GBTC_BACKEND must be auto, gles, vulkan, or opencl; this is an iGPU-only miner and CPU mining is intentionally not implemented");
+    }
+    const gbtc_backend_t *backend = backend_for_kind(kind);
+    char reason[512] = "";
+    if (!backend || backend->probe(reason, sizeof(reason)) != 0) {
+        DIE("requested backend %s is unavailable: %s", requested, reason);
+    }
+    set_selected_backend_status(backend, "");
+    return backend;
+}
+
+static int print_probe_only(const char *requested)
+{
+    const gbtc_backend_t *priority[] = {
+        &gbtc_vulkan_backend,
+        &gbtc_gles_backend,
+        &gbtc_opencl_backend,
+    };
+    init_device_path_status();
+    if (!gbtc_backend_is_auto(requested)) {
+        gbtc_backend_kind_t kind;
+        if (gbtc_parse_backend_kind(requested, &kind) != 0) {
+            fprintf(stderr, "GBTC_BACKEND must be auto, gles, vulkan, or opencl; this is an iGPU-only miner and CPU mining is intentionally not implemented\n");
+            return 2;
+        }
+        const gbtc_backend_t *backend = backend_for_kind(kind);
+        char reason[512] = "";
+        int ok = backend && backend->probe(reason, sizeof(reason)) == 0;
+        printf("%-6s %s %s\n", backend->name, ok ? "available" : "unavailable", reason);
+        return ok ? 0 : 2;
+    }
+
+    int any_ok = 0;
+    for (size_t i = 0; i < sizeof(priority) / sizeof(priority[0]); i++) {
+        char reason[512] = "";
+        int ok = priority[i]->probe(reason, sizeof(reason)) == 0;
+        if (ok) any_ok = 1;
+        printf("%-6s %s %s\n", priority[i]->name, ok ? "available" : "unavailable", reason);
+    }
+    return any_ok ? 0 : 2;
+}
+
+typedef struct {
+    int ok;
+    uint32_t local_size;
+    uint32_t batch_nonces;
+    double seconds;
+    uint64_t hashes;
+    double mh_s;
+    char compile_result[512];
+    char error[256];
+} bench_summary_t;
+
+static double monotonic_seconds(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void json_print_string(const char *s)
+{
+    putchar('"');
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        switch (*p) {
+        case '"': printf("\\\""); break;
+        case '\\': printf("\\\\"); break;
+        case '\b': printf("\\b"); break;
+        case '\f': printf("\\f"); break;
+        case '\n': printf("\\n"); break;
+        case '\r': printf("\\r"); break;
+        case '\t': printf("\\t"); break;
+        default:
+            if (*p < 0x20) printf("\\u%04x", *p);
+            else putchar(*p);
+            break;
+        }
+    }
+    putchar('"');
+}
+
+static uint32_t active_dispatch_quantum(const gbtc_backend_t *backend)
+{
+    if (backend && backend->kind == GBTC_BACKEND_GLES) {
+        return gbtc_gles_batch_quantum(&gles_config);
+    }
+    return 64u;
+}
+
+static const char *active_gles_kernel_name(const gbtc_backend_t *backend)
+{
+    if (backend && backend->kind == GBTC_BACKEND_GLES) {
+        return gbtc_gles_kernel_name(gles_config.kernel);
+    }
+    return "";
+}
+
+static uint32_t active_gles_local_size(const gbtc_backend_t *backend)
+{
+    if (backend && backend->kind == GBTC_BACKEND_GLES) return gles_config.local_size;
+    return 0;
+}
+
+static int run_benchmark_loop(const gbtc_backend_t *backend, const char *compile_result,
+                              bench_summary_t *summary)
+{
+    memset(summary, 0, sizeof(*summary));
+    summary->ok = 1;
+    summary->local_size = active_gles_local_size(backend);
+    snprintf(summary->compile_result, sizeof(summary->compile_result), "%s",
+             compile_result ? compile_result : "");
+
+    char reason[256] = "";
+    int64_t bench_seconds = gbtc_parse_seconds_default(getenv("GBTC_BENCH_SECONDS"), 60,
+                                                       "GBTC_BENCH_SECONDS", reason, sizeof(reason));
+    if (bench_seconds < 0) DIE("%s", reason);
+    int64_t warmup_seconds = gbtc_parse_seconds_default(getenv("GBTC_BENCH_WARMUP_SECONDS"), 5,
+                                                        "GBTC_BENCH_WARMUP_SECONDS", reason, sizeof(reason));
+    if (warmup_seconds < 0) DIE("%s", reason);
+
+    uint32_t quantum = active_dispatch_quantum(backend);
+    uint32_t batch_nonces = parse_batch_nonces(quantum);
+    summary->batch_nonces = batch_nonces;
+
+    gbtc_work_batch_t work = {0};
+    gbtc_make_synthetic_work(&work, batch_nonces);
+
+    double warmup_deadline = monotonic_seconds() + (double)warmup_seconds;
+    while (monotonic_seconds() < warmup_deadline) {
+        gbtc_backend_result_t result = {0};
+        if (backend->run_batch(&work, &result) != 0) {
+            summary->ok = 0;
+            snprintf(summary->error, sizeof(summary->error), "warmup batch failed");
+            return -1;
+        }
+        work.nonce_base += batch_nonces;
+    }
+
+    double start = monotonic_seconds();
+    double deadline = start + (double)bench_seconds;
+    uint64_t hashes = 0;
+    while (monotonic_seconds() < deadline) {
+        gbtc_backend_result_t result = {0};
+        if (backend->run_batch(&work, &result) != 0) {
+            summary->ok = 0;
+            snprintf(summary->error, sizeof(summary->error), "timed batch failed");
+            break;
+        }
+        hashes += result.hashes_done;
+        work.nonce_base += batch_nonces;
+    }
+    double end = monotonic_seconds();
+    summary->seconds = end - start;
+    summary->hashes = hashes;
+    summary->mh_s = summary->seconds > 0 ? (double)hashes / 1e6 / summary->seconds : 0;
+    return summary->ok ? 0 : -1;
+}
+
+static void print_benchmark_json(const gbtc_backend_t *backend, const bench_summary_t *summary)
+{
+    printf("{\"ok\":%s,\"backend\":", summary->ok ? "true" : "false");
+    json_print_string(backend ? backend->name : "unknown");
+    printf(",\"backend_api\":");
+    json_print_string(backend ? backend->api : "none");
+    printf(",\"device_path\":");
+    json_print_string(g_device_path);
+    printf(",\"device_vendor\":");
+    json_print_string(g_device_vendor);
+    printf(",\"device_name\":");
+    json_print_string(g_device_name);
+    printf(",\"driver_name\":");
+    json_print_string(g_driver_name);
+    printf(",\"kernel\":");
+    json_print_string(active_gles_kernel_name(backend));
+    printf(",\"local_size\":%u", summary->local_size);
+    printf(",\"batch_nonces\":%u", summary->batch_nonces);
+    printf(",\"seconds\":%.6f", summary->seconds);
+    printf(",\"hashes\":%" PRIu64, summary->hashes);
+    printf(",\"mh_s\":%.6f", summary->mh_s);
+    printf(",\"compile_result\":");
+    json_print_string(summary->compile_result);
+    if (!summary->ok) {
+        printf(",\"error\":");
+        json_print_string(summary->error);
+    }
+    printf("}\n");
+    fflush(stdout);
+}
+
+static int run_benchmark_and_exit(const gbtc_backend_t *backend, const char *compile_result)
+{
+    bench_summary_t summary;
+    int rc = run_benchmark_loop(backend, compile_result, &summary);
+    print_benchmark_json(backend, &summary);
+    backend->shutdown();
+    return rc == 0 ? 0 : 2;
+}
+
+static void print_autotune_rank_json(int rank, const gbtc_backend_t *backend,
+                                     const bench_summary_t *summary)
+{
+    printf("{\"type\":\"autotune_rank\",\"rank\":%d,\"backend\":", rank);
+    json_print_string(backend ? backend->name : "unknown");
+    printf(",\"kernel\":");
+    json_print_string(active_gles_kernel_name(backend));
+    printf(",\"local_size\":%u,\"mh_s\":%.6f,\"seconds\":%.6f,\"hashes\":%" PRIu64 ",\"ok\":%s}\n",
+           summary->local_size, summary->mh_s, summary->seconds, summary->hashes,
+           summary->ok ? "true" : "false");
+}
+
+static int run_gles_autotune_and_exit(const gbtc_backend_t *backend)
+{
+    if (!backend || backend->kind != GBTC_BACKEND_GLES) {
+        DIE("GBTC_GLES_AUTOTUNE requires the gles backend");
+    }
+
+    static const uint32_t local_sizes[] = {8, 16, 32, 64, 128, 256};
+    bench_summary_t summaries[sizeof(local_sizes) / sizeof(local_sizes[0])];
+    int any_ok = 0;
+
+    const char *old_local = getenv("GBTC_GLES_LOCAL_SIZE");
+    char old_local_copy[32] = "";
+    int had_old_local = old_local && old_local[0];
+    if (had_old_local) snprintf(old_local_copy, sizeof(old_local_copy), "%s", old_local);
+
+    for (size_t i = 0; i < sizeof(local_sizes) / sizeof(local_sizes[0]); i++) {
+        char local_buf[16];
+        snprintf(local_buf, sizeof(local_buf), "%u", local_sizes[i]);
+        setenv("GBTC_GLES_LOCAL_SIZE", local_buf, 1);
+
+        char init_reason[512] = "";
+        memset(&summaries[i], 0, sizeof(summaries[i]));
+        summaries[i].local_size = local_sizes[i];
+        if (backend->init(init_reason, sizeof(init_reason)) != 0) {
+            summaries[i].ok = 0;
+            snprintf(summaries[i].compile_result, sizeof(summaries[i].compile_result), "%s", init_reason);
+            snprintf(summaries[i].error, sizeof(summaries[i].error), "backend init failed");
+            print_benchmark_json(backend, &summaries[i]);
+            continue;
+        }
+
+        run_benchmark_loop(backend, init_reason, &summaries[i]);
+        print_benchmark_json(backend, &summaries[i]);
+        if (summaries[i].ok) any_ok = 1;
+        backend->shutdown();
+    }
+
+    if (had_old_local) setenv("GBTC_GLES_LOCAL_SIZE", old_local_copy, 1);
+    else unsetenv("GBTC_GLES_LOCAL_SIZE");
+
+    for (size_t i = 0; i < sizeof(summaries) / sizeof(summaries[0]); i++) {
+        for (size_t j = i + 1; j < sizeof(summaries) / sizeof(summaries[0]); j++) {
+            if ((!summaries[i].ok && summaries[j].ok) ||
+                (summaries[i].ok == summaries[j].ok && summaries[j].mh_s > summaries[i].mh_s)) {
+                bench_summary_t tmp = summaries[i];
+                summaries[i] = summaries[j];
+                summaries[j] = tmp;
+            }
+        }
+    }
+    for (size_t i = 0; i < sizeof(summaries) / sizeof(summaries[0]); i++) {
+        print_autotune_rank_json((int)i + 1, backend, &summaries[i]);
+    }
+    fflush(stdout);
+    return any_ok ? 0 : 2;
+}
+
 int main(void) {
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
+    const char *backend_req = getenv("GBTC_BACKEND");
+    if (!backend_req || !backend_req[0]) backend_req = "auto";
+    init_device_path_status();
+    if (env_flag_enabled("GBTC_PROBE_ONLY")) return print_probe_only(backend_req);
+
+    int bench_only = env_flag_enabled("GBTC_BENCH_ONLY");
+    int gles_autotune = env_flag_enabled("GBTC_GLES_AUTOTUNE");
+    if (gles_autotune && !bench_only) {
+        DIE("GBTC_GLES_AUTOTUNE requires GBTC_BENCH_ONLY=1");
+    }
+
+    const gbtc_backend_t *backend = select_backend_or_die(backend_req);
+    if (bench_only && gles_autotune) {
+        return run_gles_autotune_and_exit(backend);
+    }
+
+    char backend_reason[512] = "";
+    if (backend->init(backend_reason, sizeof(backend_reason)) != 0) {
+        DIE("backend %s init failed: %s", backend->name, backend_reason);
+    }
+    LOG("selected backend=%s api=%s %s", backend->name, backend->api, backend_reason);
+
+    if (bench_only) {
+        return run_benchmark_and_exit(backend, backend_reason);
+    }
+
     const char *btc = getenv("BTC_ADDRESS");
     const char *url = getenv("POOL_URL");
     const char *worker = getenv("WORKER_NAME");
@@ -1127,8 +1575,6 @@ int main(void) {
     snprintf(g_pool_url, sizeof(g_pool_url), "%s", url);
     snprintf(g_worker, sizeof(g_worker), "%s", worker);
     snprintf(g_btc_addr, sizeof(g_btc_addr), "%s", btc);
-
-    gl_init();
 
     pthread_t ht;
     if (pthread_create(&ht, NULL, http_thread, NULL) == 0) pthread_detach(ht);
@@ -1152,8 +1598,7 @@ int main(void) {
     struct timespec t_batch_prev;
     clock_gettime(CLOCK_MONOTONIC, &t_batch_prev);
     uint32_t en2_counter = 0;
-    const uint32_t BATCH_NONCES = 1u << 24;  // 16M per dispatch — amortize CPU↔GPU overhead
-    const uint32_t WG_SIZE = 64;
+    const uint32_t BATCH_NONCES = parse_batch_nonces(active_dispatch_quantum(backend));
 
     while (!g_stop) {
         // Drain incoming stratum messages (non-blocking-ish)
@@ -1169,8 +1614,8 @@ int main(void) {
         uint8_t merkle_root[32];
         compute_merkle_root(merkle_root, &S, en2, en2_len);
 
-        shader_in_t in = {0};
-        build_header_midstate(in.midstate, &in.w0, &S, merkle_root);
+        gbtc_work_batch_t work = {0};
+        build_header_midstate(work.midstate, work.tail3, &S, merkle_root);
 
         char en2_hex[32];
         bin_to_hex(en2_hex, en2, en2_len);
@@ -1183,54 +1628,35 @@ int main(void) {
         uint32_t base = 0;
         for (int batch = 0; batch < (int)((1ull<<32) / BATCH_NONCES); batch++, base += BATCH_NONCES) {
             if (g_stop) break;
-            // Reset output, set input
-            shader_out_t out_init = {0};
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_out);
-            glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(out_init), &out_init);
-
-            in.nonce_base = base;
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_in);
-            glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(in), &in);
-
-            glUseProgram(compute_prog);
-            const uint32_t WGX = 256;
-            const uint32_t WGY = (BATCH_NONCES / WG_SIZE) / WGX;
-            glDispatchCompute(WGX, WGY, 1);
-            GLenum derr = glGetError();
-            if (derr != GL_NO_ERROR) LOG("dispatch err 0x%x", derr);
-            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-            glFinish();
-
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_out);
-            shader_out_t *res = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(shader_out_t), GL_MAP_READ_BIT);
-            if (!res) { LOG("glMapBufferRange err 0x%x", glGetError()); break; }
-            uint32_t nfound = res->count;
-            uint32_t nonces[15];
-            if (nfound > 15) nfound = 15;
-            for (uint32_t i = 0; i < nfound; i++) nonces[i] = res->nonces[i];
-            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-
-            for (uint32_t i = 0; i < nfound; i++) {
-                stratum_submit(&S, job_id_snapshot, en2_hex, ntime_snapshot, nonces[i]);
+            work.nonce_base = base;
+            work.nonce_count = BATCH_NONCES;
+            gbtc_backend_result_t result = {0};
+            if (backend->run_batch(&work, &result) != 0) {
+                LOG("backend %s batch failed", backend->name);
+                break;
             }
 
-            total_hashes += BATCH_NONCES;
+            for (uint32_t i = 0; i < result.count; i++) {
+                stratum_submit(&S, job_id_snapshot, en2_hex, ntime_snapshot, result.nonces[i]);
+            }
+
+            total_hashes += result.hashes_done;
             // Per-batch instantaneous MH/s — fed to metrics timer thread (pushes 1Hz)
             struct timespec t_batch_now;
             clock_gettime(CLOCK_MONOTONIC, &t_batch_now);
             double batch_secs = (t_batch_now.tv_sec - t_batch_prev.tv_sec) +
                                 (t_batch_now.tv_nsec - t_batch_prev.tv_nsec) / 1e9;
             t_batch_prev = t_batch_now;
-            double inst = batch_secs > 0 ? (double)BATCH_NONCES / 1e6 / batch_secs : 0;
+            double inst = batch_secs > 0 ? (double)result.hashes_done / 1e6 / batch_secs : 0;
             pthread_mutex_lock(&m_mu);
-            g_lifetime_hashes += BATCH_NONCES;
+            g_lifetime_hashes += result.hashes_done;
             g_inst_mh = inst;
             pthread_mutex_unlock(&m_mu);
             time_t now = time(NULL);
             if (now - t_last >= 10) {
                 double secs = (double)(now - t_last);
                 double mh = (double)total_hashes / 1e6 / secs;
-                LOG("hashrate ~%.2f MH/s (batch=%u, found=%u)", mh, BATCH_NONCES, nfound);
+                LOG("hashrate ~%.2f MH/s (batch=%u, found=%u)", mh, BATCH_NONCES, result.count);
                 total_hashes = 0;
                 t_last = now;
             }
@@ -1245,7 +1671,6 @@ int main(void) {
     }
 
     LOG("shutting down");
-    eglDestroyContext(egl_dpy, egl_ctx);
-    eglTerminate(egl_dpy);
+    backend->shutdown();
     return 0;
 }

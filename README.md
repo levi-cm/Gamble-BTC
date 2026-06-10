@@ -1,6 +1,6 @@
 # Gamble BTC
 
-Gamble BTC is an experimental single-file Bitcoin solo miner that uses an
+Gamble BTC is an experimental iGPU-only Bitcoin solo miner that uses an
 integrated GPU through EGL surfaceless rendering and a GLES 3.2 compute shader.
 The current container is tuned for a local Intel HD 4600 / Mesa crocus setup and
 talks to a Stratum pool such as `public-pool.io`.
@@ -13,10 +13,16 @@ and containerized access to Linux DRM devices.
 
 - Current target: Intel HD 4600 class iGPU using Mesa crocus.
 - Runtime shape: one C binary in a Debian-based Docker image.
-- Control surface: HTTP status page and server-sent events on port `41174`.
+- Backend shape: `auto -> vulkan -> gles -> opencl`, with GLES implemented now
+  and Vulkan/OpenCL visible as future iGPU backend probes.
+- Control surface: HTTP status page, `/status.json`, and server-sent events on
+  port `41174`.
 - Mining mode: solo Stratum flow with the configured BTC address as username.
 - Compose file: intentionally host-specific for the original development
   machine.
+- CPU mining is intentionally not implemented. The project exists to keep mining
+  work on the integrated GPU, where it can run with much lower CPU load than a
+  CPU miner. Host-side hashing is only used for work construction and tests.
 
 The next major scope expansion is to support the major integrated GPU families
 instead of only this one host/GPU path. See [docs/ROADMAP.md](docs/ROADMAP.md).
@@ -25,6 +31,8 @@ instead of only this one host/GPU path. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 - Mining results are probabilistic. On consumer iGPUs, finding a Bitcoin block
   is extremely unlikely.
+- This is not a CPU miner. Use an existing CPU miner if you want CPU mining; it
+  is intentionally outside this project's scope.
 - Do not commit your real `.env`. This repo ignores it by default.
 - Verify your BTC address before running. Submitted shares use the configured
   address and worker name.
@@ -65,6 +73,16 @@ Environment variables:
 | `BTC_ADDRESS` | Yes | none | Bech32 BTC address used as the Stratum username. |
 | `POOL_URL` | No | `stratum+tcp://public-pool.io:21496` | Stratum TCP endpoint. |
 | `WORKER_NAME` | No | `x` | Worker name sent as the Stratum password. |
+| `GBTC_BACKEND` | No | `auto` | iGPU backend selection: `auto`, `gles`, `vulkan`, or `opencl`. |
+| `GBTC_PROBE_ONLY` | No | `0` | Set to `1` to print backend availability and exit without mining. |
+| `GBTC_DEVICE` | No | `/dev/dri/renderD128` | Render node expected by GPU backends. |
+| `GBTC_BATCH_NONCES` | No | `16777216` | Power-of-two nonce batch size; must be a multiple of 64. |
+| `GBTC_BENCH_ONLY` | No | `0` | Set to `1` to run deterministic synthetic work and exit without Stratum. |
+| `GBTC_BENCH_SECONDS` | No | `60` | Timed benchmark duration in seconds. |
+| `GBTC_BENCH_WARMUP_SECONDS` | No | `5` | Warmup duration before measured benchmark work. |
+| `GBTC_GLES_KERNEL` | No | `altbool` | GLES shader variant: `unrolled`, `partial`, `looped`, `altbool`, or `dualnonce`. |
+| `GBTC_GLES_LOCAL_SIZE` | No | `16` | GLES compute local size: `auto`, `8`, `16`, `32`, `64`, `128`, or `256`. |
+| `GBTC_GLES_AUTOTUNE` | No | `0` | With `GBTC_BENCH_ONLY=1`, benchmark the selected GLES kernel across all local sizes. |
 
 ## Run
 
@@ -84,6 +102,25 @@ Open the local status page:
 
 ```text
 http://localhost:41174/
+http://localhost:41174/status.json
+```
+
+Probe the configured iGPU stack without connecting to the pool:
+
+```sh
+GBTC_PROBE_ONLY=1 docker compose run --rm miner
+```
+
+Run the current GLES benchmark path without connecting to the pool:
+
+```sh
+scripts/bench-current.sh
+```
+
+Run the full GLES kernel/local-size matrix and store JSONL results locally:
+
+```sh
+scripts/bench-gles-matrix.sh
 ```
 
 Stop the container:
@@ -100,8 +137,14 @@ Build the binary through Docker:
 docker compose build
 ```
 
-The image build compiles `miner.c` with GCC and links against EGL, GLESv2,
-cJSON, pthreads, and math libraries.
+The image build compiles the `src/` C sources with GCC and links against EGL,
+GLESv2, cJSON, pthreads, and math libraries.
+
+Run deterministic helper tests locally:
+
+```sh
+make test
+```
 
 For direct host builds, install equivalent development packages for your
 distribution, then compile with the same flags used in the Dockerfile.
@@ -110,7 +153,9 @@ distribution, then compile with the same flags used in the Dockerfile.
 
 ```text
 .
-|-- miner.c          # Miner, Stratum client, GPU kernel generation, HTTP status UI
+|-- src/             # Miner runtime, SHA helpers, and backend selection helpers
+|-- tests/           # Host-side deterministic C tests
+|-- Makefile         # Local and Docker build entrypoint
 |-- Dockerfile       # Multi-stage container build
 |-- compose.yaml     # Host-specific runtime wiring
 |-- .env.example     # Safe example configuration

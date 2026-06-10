@@ -5,9 +5,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libegl-dev libgles-dev libgl-dev libcjson-dev \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY miner.c /src/
-RUN gcc -O3 -march=native -mtune=native -Wall -Wextra \
-        miner.c -o miner -lEGL -lGLESv2 -lcjson -lpthread -lm \
+COPY Makefile /src/
+COPY src/ /src/src/
+RUN make \
  && strip miner
 
 FROM debian:trixie-slim

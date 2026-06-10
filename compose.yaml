@@ -5,6 +5,17 @@ services:
     container_name: gamble-btc
     restart: unless-stopped
     env_file: .env
+    environment:
+      GBTC_BACKEND: ${GBTC_BACKEND:-auto}
+      GBTC_PROBE_ONLY: ${GBTC_PROBE_ONLY:-0}
+      GBTC_DEVICE: ${GBTC_DEVICE:-/dev/dri/renderD128}
+      GBTC_BATCH_NONCES: ${GBTC_BATCH_NONCES:-16777216}
+      GBTC_BENCH_ONLY: ${GBTC_BENCH_ONLY:-0}
+      GBTC_BENCH_SECONDS: ${GBTC_BENCH_SECONDS:-60}
+      GBTC_BENCH_WARMUP_SECONDS: ${GBTC_BENCH_WARMUP_SECONDS:-5}
+      GBTC_GLES_KERNEL: ${GBTC_GLES_KERNEL:-altbool}
+      GBTC_GLES_LOCAL_SIZE: ${GBTC_GLES_LOCAL_SIZE:-16}
+      GBTC_GLES_AUTOTUNE: ${GBTC_GLES_AUTOTUNE:-0}
     devices:
       - /dev/dri/card0:/dev/dri/card0
       - /dev/dri/renderD128:/dev/dri/renderD128
@@ -12,5 +23,5 @@ services:
       - "44"
       - "992"
     ports:
-      - "41174:41174"
+      - "0.0.0.0:41174:41174"
     mem_limit: 1g
