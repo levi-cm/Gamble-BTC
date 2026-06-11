@@ -2,7 +2,7 @@
 
 Gamble BTC is an experimental iGPU-only Bitcoin solo miner that uses an
 integrated GPU through EGL surfaceless rendering and a GLES 3.2 compute shader.
-The current container is tuned for a local Intel HD 4600 / Mesa crocus setup and
+The current container is tuned for a local Intel Iris Xe / Mesa iris setup and
 talks to a Stratum pool such as `public-pool.io`.
 
 This project is not production mining software. It is an educational prototype
@@ -11,7 +11,7 @@ and containerized access to Linux DRM devices.
 
 ## Current Status
 
-- Current target: Intel HD 4600 class iGPU using Mesa crocus.
+- Current target: Intel Iris Xe / Xe-LP class iGPU using Mesa iris.
 - Runtime shape: one C binary in a Debian-based Docker image.
 - Backend shape: `auto -> vulkan -> gles -> opencl`, with GLES implemented now
   and Vulkan/OpenCL visible as future iGPU backend probes.
@@ -42,7 +42,8 @@ instead of only this one host/GPU path. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Requirements
 
-- Linux host with Docker Compose.
+- Linux host with Docker.
+- Docker Compose if using the Compose workflow or benchmark helper scripts.
 - DRM render devices exposed at the paths used in `compose.yaml`.
 - Mesa userspace support for the target iGPU.
 - Network access to the configured Stratum endpoint.
@@ -50,10 +51,10 @@ instead of only this one host/GPU path. See [docs/ROADMAP.md](docs/ROADMAP.md).
 The included Compose file currently expects:
 
 ```text
-/dev/dri/card0
+/dev/dri/card1
 /dev/dri/renderD128
-video group id 44
-render group id 992
+video group id 983
+render group id 987
 ```
 
 Those values are intentionally not generalized yet.
@@ -71,7 +72,7 @@ Environment variables:
 | Name | Required | Default | Description |
 | --- | --- | --- | --- |
 | `BTC_ADDRESS` | Yes | none | Bech32 BTC address used as the Stratum username. |
-| `POOL_URL` | No | `stratum+tcp://public-pool.io:21496` | Stratum TCP endpoint. |
+| `POOL_URL` | No | `stratum+tcp://public-pool.io:3333` | Stratum TCP endpoint. |
 | `WORKER_NAME` | No | `x` | Worker name sent as the Stratum password. |
 | `GBTC_BACKEND` | No | `auto` | iGPU backend selection: `auto`, `gles`, `vulkan`, or `opencl`. |
 | `GBTC_PROBE_ONLY` | No | `0` | Set to `1` to print backend availability and exit without mining. |
@@ -83,6 +84,7 @@ Environment variables:
 | `GBTC_GLES_KERNEL` | No | `altbool` | GLES shader variant: `unrolled`, `partial`, `looped`, `altbool`, or `dualnonce`. |
 | `GBTC_GLES_LOCAL_SIZE` | No | `16` | GLES compute local size: `auto`, `8`, `16`, `32`, `64`, `128`, or `256`. |
 | `GBTC_GLES_AUTOTUNE` | No | `0` | With `GBTC_BENCH_ONLY=1`, benchmark the selected GLES kernel across all local sizes. |
+| `MESA_NO_ERROR` | No | `1` | Mesa no-error mode; measured faster on the Iris Xe GLES benchmark path. |
 
 ## Run
 
@@ -92,10 +94,17 @@ Build and start the container:
 docker compose up -d --build
 ```
 
+Or start the finalized Iris Xe runtime directly from zsh:
+
+```sh
+scripts/start-miner.sh
+```
+
 Follow logs:
 
 ```sh
 docker compose logs -f
+docker logs -f gamble-btc
 ```
 
 Open the local status page:
@@ -127,11 +136,18 @@ Stop the container:
 
 ```sh
 docker compose down
+scripts/stop-miner.sh
 ```
 
 ## Development
 
 Build the binary through Docker:
+
+```sh
+docker build -t gamble-btc:latest .
+```
+
+Or use the Compose workflow when Docker Compose is installed:
 
 ```sh
 docker compose build

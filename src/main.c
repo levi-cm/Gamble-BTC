@@ -1,5 +1,5 @@
-// gamble-btc — DIY iGPU SHA-256d solo miner for HD 4600
-// Path: EGL surfaceless + GLES 3.2 compute shader (Mesa crocus driver)
+// gamble-btc - DIY iGPU SHA-256d solo miner
+// Path: EGL surfaceless + GLES 3.2 compute shader
 // Pool: stratum+tcp (public-pool.io)
 //
 // Educational. NOT optimized for max hashrate.
@@ -881,7 +881,7 @@ static const char *index_html =
     ".cell .v{color:#0f0;font-size:15px;margin-top:3px;word-break:break-all}"
     ".cell .v.sm{font-size:11px;color:#0a0}"
     "</style>"
-    "<header><h1>gamble-btc :: HD 4600 iGPU</h1><span id=conn>connecting...</span></header>"
+    "<header><h1 id=rig_title>gamble-btc :: iGPU</h1><span id=conn>connecting...</span></header>"
     "<div id=stat>--.- MH/s</div>"
     "<div id=sub>last 300 samples (5 min, 1s tick) &middot; SSE stream, server idle when tab closed</div>"
     "<canvas id=c></canvas>"
@@ -933,6 +933,7 @@ static const char *index_html =
     "const cv=document.getElementById('c'),ctx=cv.getContext('2d');"
     "const st=document.getElementById('stat'),conn=document.getElementById('conn');"
     "const $=id=>document.getElementById(id);"
+    "const rig=$('rig_title');"
     "let data=[];"
     "function fmt(n){if(n>=1e12)return(n/1e12).toFixed(2)+'T';if(n>=1e9)return(n/1e9).toFixed(2)+'G';if(n>=1e6)return(n/1e6).toFixed(2)+'M';if(n>=1e3)return(n/1e3).toFixed(2)+'k';return n.toFixed(0);}"
     "function fmtUp(s){s=Math.floor(s);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return(d?d+'d ':'')+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s%60).padStart(2,'0');}"
@@ -984,7 +985,7 @@ static const char *index_html =
     "if(o.accepted!=null)$('f_acc').textContent=o.accepted;"
     "if(o.rejected!=null)$('f_rej').textContent=o.rejected;"
     "if(o.diff!=null)$('f_diff').textContent=o.diff;"
-    "if(o.job)$('f_job').textContent=o.job;"
+    "if(o.job!=null)$('f_job').textContent=o.job||'waiting for stratum job';"
     "if(o.ntime!=null)$('f_nt').textContent='0x'+o.ntime.toString(16);"
     "if(o.nbits!=null)$('f_nb').textContent='0x'+o.nbits.toString(16);"
     "if(o.merkle_branches!=null)$('f_mb').textContent=o.merkle_branches;"
@@ -995,7 +996,7 @@ static const char *index_html =
     "if(o.backend_api)$('f_backend_api').textContent=o.backend_api;"
     "if(o.device_path)$('f_device_path').textContent=o.device_path;"
     "if(o.device_vendor)$('f_device_vendor').textContent=o.device_vendor;"
-    "if(o.device_name)$('f_device_name').textContent=o.device_name;"
+    "if(o.device_name){$('f_device_name').textContent=o.device_name;if(rig)rig.textContent='gamble-btc :: '+o.device_name;}"
     "if(o.driver_name)$('f_driver_name').textContent=o.driver_name;"
     "if(o.fallback_reason)$('f_fallback_reason').textContent=o.fallback_reason;"
     "if(o.net_diff!=null)$('f_nd').textContent=o.net_diff>0?fmt(o.net_diff)+' ('+o.net_diff.toExponential(3)+')':'-';"
@@ -1004,6 +1005,7 @@ static const char *index_html =
     "if(o.eta_block_s!=null)$('f_eta').textContent=fmtDur(o.eta_block_s);"
     "if(o.prob_block_24h!=null)$('f_p24').textContent=fmtPct(o.prob_block_24h);"
     "if(o.prob_block_per_day!=null){const py=1-Math.exp(-o.prob_block_per_day*365.25);$('f_py').textContent=fmtPct(py);$('f_bpy').textContent=(o.prob_block_per_day*365.25).toExponential(3);}"
+    "if(o.job!=null&&o.mh!=null)conn.textContent=(!o.job&&o.mh===0)?'waiting for stratum job':'live';"
     "draw();"
     "}"
     "const es=new EventSource('/events');"
@@ -1567,7 +1569,7 @@ int main(void) {
     const char *url = getenv("POOL_URL");
     const char *worker = getenv("WORKER_NAME");
     if (!btc) DIE("BTC_ADDRESS env not set");
-    if (!url) url = "stratum+tcp://public-pool.io:21496";
+    if (!url) url = "stratum+tcp://public-pool.io:3333";
     if (!worker) worker = "x";
     LOG("addr=%s pool=%s worker=%s", btc, url, worker);
 

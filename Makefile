@@ -5,7 +5,7 @@ LDLIBS ?= -lEGL -lGLESv2 -lcjson -lpthread -lm
 
 SRC := src/main.c src/sha256.c src/backend.c src/gles_tuning.c src/bench.c
 OBJ := $(SRC:src/%.c=build/%.o)
-TEST_BINS := build/test_sha256 build/test_backend_selection build/test_gles_tuning build/test_bench_config
+TEST_BINS := build/test_sha256 build/test_backend_selection build/test_gles_tuning build/test_bench_config build/test_ui_contract
 
 .PHONY: all test clean
 
@@ -34,11 +34,16 @@ build/test_bench_config: tests/test_bench_config.c src/bench.c src/bench.h src/b
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Wall -Wextra -std=c11 $< src/bench.c src/sha256.c -o $@
 
+build/test_ui_contract: tests/test_ui_contract.c src/main.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Wall -Wextra -std=c11 $< -o $@
+
 test: $(TEST_BINS)
 	./build/test_sha256
 	./build/test_backend_selection
 	./build/test_gles_tuning
 	./build/test_bench_config
+	./build/test_ui_contract
 
 clean:
 	rm -rf build miner

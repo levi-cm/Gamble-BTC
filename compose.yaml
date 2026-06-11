@@ -16,12 +16,13 @@ services:
       GBTC_GLES_KERNEL: ${GBTC_GLES_KERNEL:-altbool}
       GBTC_GLES_LOCAL_SIZE: ${GBTC_GLES_LOCAL_SIZE:-16}
       GBTC_GLES_AUTOTUNE: ${GBTC_GLES_AUTOTUNE:-0}
+      MESA_NO_ERROR: ${MESA_NO_ERROR:-1}
     devices:
-      - /dev/dri/card0:/dev/dri/card0
+      - /dev/dri/card1:/dev/dri/card1
       - /dev/dri/renderD128:/dev/dri/renderD128
     group_add:
-      - "44"
-      - "992"
+      - "983"
+      - "987"
     ports:
       - "0.0.0.0:41174:41174"
     mem_limit: 1g
