@@ -15,6 +15,7 @@ typedef enum {
 typedef struct {
     uint32_t midstate[8];
     uint32_t tail3[3];
+    uint32_t target[8];
     uint32_t nonce_base;
     uint32_t nonce_count;
 } gbtc_work_batch_t;

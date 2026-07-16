@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and analysis dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libegl-dev libgles-dev libgl-dev libcjson-dev cppcheck
+      - name: Build with warnings as errors
+        run: make CFLAGS="-O2 -Wall -Wextra -Werror -std=c11"
+      - name: Unit and protocol tests
+        run: make test
+      - name: AddressSanitizer
+        run: make test-asan
+      - name: UndefinedBehaviorSanitizer
+        run: make test-ubsan
+      - name: Static analysis
+        run: make static-analysis
+      - name: Compose validation
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+      - name: Container build
+        run: docker build -t gamble-btc:ci .

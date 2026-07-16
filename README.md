@@ -36,8 +36,9 @@ instead of only this one host/GPU path. See [docs/ROADMAP.md](docs/ROADMAP.md).
 - Do not commit your real `.env`. This repo ignores it by default.
 - Verify your BTC address before running. Submitted shares use the configured
   address and worker name.
-- The HTTP status port has no authentication. Keep it on a trusted network or
-  add a reverse proxy/auth layer before exposing it.
+- The HTTP status port has no authentication and binds to loopback by default.
+  Use LAN binding only on a trusted network; add authentication before broader
+  exposure.
 - This is not financial advice and does not guarantee earnings.
 
 ## Requirements
@@ -77,6 +78,8 @@ Environment variables:
 | `GBTC_BACKEND` | No | `auto` | iGPU backend selection: `auto`, `gles`, `vulkan`, or `opencl`. |
 | `GBTC_PROBE_ONLY` | No | `0` | Set to `1` to print backend availability and exit without mining. |
 | `GBTC_DEVICE` | No | `/dev/dri/renderD128` | Render node expected by GPU backends. |
+| `GBTC_HTTP_BIND` | No | `127.0.0.1` | IPv4 bind address for direct or host-network status serving; use `0.0.0.0` to opt into trusted-LAN access. |
+| `GBTC_STATUS_BIND` | No | `127.0.0.1` | Compose host-port bind; use `0.0.0.0` to opt into trusted-LAN access. |
 | `GBTC_BATCH_NONCES` | No | `16777216` | Power-of-two nonce batch size; must be a multiple of 64. |
 | `GBTC_BENCH_ONLY` | No | `0` | Set to `1` to run deterministic synthetic work and exit without Stratum. |
 | `GBTC_BENCH_SECONDS` | No | `60` | Timed benchmark duration in seconds. |
@@ -113,6 +116,10 @@ Open the local status page:
 http://localhost:41174/
 http://localhost:41174/status.json
 ```
+
+Compose keeps the host port on loopback while the process listens inside the
+container for port forwarding. Set `GBTC_STATUS_BIND=0.0.0.0` only when LAN
+access is intended.
 
 Probe the configured iGPU stack without connecting to the pool:
 

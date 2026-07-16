@@ -187,8 +187,9 @@ static void append_prefix(sb_t *sb, const gbtc_gles_config_t *cfg)
         "layout(std430, binding = 0) readonly buffer In {\n"
         "  uint midstate[8];\n"
         "  uint w0_in; uint w1_in; uint w2_in;\n"
+        "  uint target_word0;\n"
         "  uint nonce_base;\n"
-        "  uint pad[3];\n"
+        "  uint pad[2];\n"
         "} I;\n"
         "layout(std430, binding = 1) buffer Out {\n"
         "  uint count;\n"
@@ -209,6 +210,8 @@ static void append_prefix(sb_t *sb, const gbtc_gles_config_t *cfg)
             "#define CH(x,y,z) (((x)&(y))^(~(x)&(z)))\n"
             "#define MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))\n");
     }
+    sb_appendf(sb,
+        "#define BSWAP32(x) (((x)>>24u)|(((x)>>8u)&0x0000ff00u)|(((x)<<8u)&0x00ff0000u)|((x)<<24u))\n");
 }
 
 static void append_unrolled(sb_t *sb, const gbtc_gles_config_t *cfg)
@@ -303,7 +306,7 @@ static void append_unrolled(sb_t *sb, const gbtc_gles_config_t *cfg)
     }
     sb_appendf(sb,
         "  uint final_h7 = 0x5be0cd19u + %s;\n"
-        "  if (final_h7 == 0u) {\n"
+        "  if (BSWAP32(final_h7) <= I.target_word0) {\n"
         "    uint idx = atomicAdd(O.count, 1u);\n"
         "    if (idx < 15u) O.nonces[idx] = nonce;\n"
         "  }\n"
@@ -392,7 +395,7 @@ static void append_round_function(sb_t *sb, int ring_schedule)
         "  }\n"
         "  return 0x5be0cd19u + h;\n"
         "}\n"
-        "bool nonce_matches(uint nonce) { return final_word7(nonce) == 0u; }\n");
+        "bool nonce_matches(uint nonce) { return BSWAP32(final_word7(nonce)) <= I.target_word0; }\n");
 }
 
 static void append_looped_main(sb_t *sb, const gbtc_gles_config_t *cfg)

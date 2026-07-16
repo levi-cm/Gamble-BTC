@@ -37,6 +37,35 @@ static int expect_hash(const char *name, const uint8_t got[32], const char *want
     return 0;
 }
 
+static void put_le32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+    dst[2] = (uint8_t)(value >> 16);
+    dst[3] = (uint8_t)(value >> 24);
+}
+
+static int expect_genesis_header(const char *name, uint32_t timestamp, uint32_t nonce,
+                                 const char *want_raw_hash)
+{
+    uint8_t header[80] = {0};
+    uint8_t merkle_root[32];
+    uint8_t hash[32];
+    if (hex_to_bin(merkle_root,
+                   "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a",
+                   sizeof(merkle_root)) != 0) {
+        fprintf(stderr, "%s: invalid merkle-root vector\n", name);
+        return 1;
+    }
+    put_le32(header, 1u);
+    memcpy(header + 36, merkle_root, sizeof(merkle_root));
+    put_le32(header + 68, timestamp);
+    put_le32(header + 72, 0x1d00ffffu);
+    put_le32(header + 76, nonce);
+    gbtc_sha256d(hash, header, sizeof(header));
+    return expect_hash(name, hash, want_raw_hash);
+}
+
 int main(void)
 {
     int failures = 0;
@@ -61,6 +90,13 @@ int main(void)
     failures += expect_hash("sha256d-abc", out,
                             "4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed"
                             "5ad5128cc03e6c6358");
+
+    failures += expect_genesis_header(
+        "bitcoin-mainnet-genesis-header", 1231006505u, 2083236893u,
+        "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000");
+    failures += expect_genesis_header(
+        "bitcoin-testnet3-genesis-header", 1296688602u, 414098458u,
+        "43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000");
 
     return failures ? 1 : 0;
 }

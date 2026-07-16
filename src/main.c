@@ -8,6 +8,8 @@
 #include "bench.h"
 #include "backend.h"
 #include "gles_tuning.h"
+#include "http_config.h"
+#include "stratum_protocol.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -22,6 +24,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <signal.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -161,12 +164,16 @@ typedef struct {
     char rxbuf[65536];
     size_t rxlen;
     char extranonce1[33];
-    int extranonce1_len;
-    int extranonce2_size;
+    size_t extranonce1_len;
+    size_t extranonce2_size;
     int next_id;
     char username[128];
     char password[64];
     double diff;
+    uint32_t target[8];
+    uint64_t target_generation;
+    int pending_submit_ids[64];
+    size_t pending_submit_count;
     // Current job
     bool have_job;
     char job_id[64];
@@ -219,6 +226,13 @@ static int stratum_connect(stratum_t *s, const char *url) {
     s->next_id = 1;
     s->have_job = false;
     s->diff = 1.0;
+    char target_reason[128] = "";
+    if (gbtc_target_from_difficulty(s->diff, s->target,
+                                    target_reason, sizeof(target_reason)) != 0) {
+        LOG("stratum: default target failed: %s", target_reason);
+        close(fd);
+        return -1;
+    }
     LOG("stratum: connected");
     return 0;
 }
@@ -229,9 +243,30 @@ static int stratum_send(stratum_t *s, const char *json) {
     if (len + 2 > sizeof(buf)) return -1;
     memcpy(buf, json, len);
     buf[len] = '\n'; buf[len+1] = 0;
-    ssize_t w = send(s->fd, buf, len+1, 0);
-    if (w != (ssize_t)(len+1)) { LOG("send fail %zd", w); return -1; }
+    size_t sent = 0;
+    while (sent < len + 1u) {
+        ssize_t w = send(s->fd, buf + sent, len + 1u - sent, MSG_NOSIGNAL);
+        if (w <= 0) { LOG("send fail %zd", w); return -1; }
+        sent += (size_t)w;
+    }
     return 0;
+}
+
+static int stratum_send_method(stratum_t *s, int id, const char *method, cJSON *params)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root || !params || !cJSON_AddNumberToObject(root, "id", id) ||
+        !cJSON_AddStringToObject(root, "method", method)) {
+        cJSON_Delete(params);
+        cJSON_Delete(root);
+        return -1;
+    }
+    cJSON_AddItemToObject(root, "params", params);
+    char *json = cJSON_PrintUnformatted(root);
+    int result = json ? stratum_send(s, json) : -1;
+    cJSON_free(json);
+    cJSON_Delete(root);
+    return result;
 }
 
 static char *stratum_readline(stratum_t *s, int timeout_ms) {
@@ -239,15 +274,24 @@ static char *stratum_readline(stratum_t *s, int timeout_ms) {
     while (1) {
         char *nl = memchr(s->rxbuf, '\n', s->rxlen);
         if (nl) {
-            *nl = 0;
             static char line[8192];
             size_t llen = nl - s->rxbuf;
-            if (llen >= sizeof(line)) llen = sizeof(line) - 1;
+            size_t consumed = llen + 1u;
+            if (llen >= sizeof(line)) {
+                memmove(s->rxbuf, s->rxbuf + consumed, s->rxlen - consumed);
+                s->rxlen -= consumed;
+                LOG("stratum: rejected line longer than %zu bytes", sizeof(line) - 1u);
+                return NULL;
+            }
             memcpy(line, s->rxbuf, llen); line[llen] = 0;
-            size_t consumed = (nl - s->rxbuf) + 1;
             memmove(s->rxbuf, s->rxbuf + consumed, s->rxlen - consumed);
             s->rxlen -= consumed;
             return line;
+        }
+        if (s->rxlen >= sizeof(s->rxbuf) - 1u) {
+            s->rxlen = 0;
+            LOG("stratum: rejected unterminated oversized message");
+            return NULL;
         }
         struct timeval tv = { timeout_ms/1000, (timeout_ms%1000)*1000 };
         fd_set rfds; FD_ZERO(&rfds); FD_SET(s->fd, &rfds);
@@ -259,35 +303,23 @@ static char *stratum_readline(stratum_t *s, int timeout_ms) {
     }
 }
 
-static void stratum_handle_notify(stratum_t *s, cJSON *params) {
-    if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) < 9) return;
-    cJSON *jid = cJSON_GetArrayItem(params, 0);
-    cJSON *prev = cJSON_GetArrayItem(params, 1);
-    cJSON *cb1 = cJSON_GetArrayItem(params, 2);
-    cJSON *cb2 = cJSON_GetArrayItem(params, 3);
-    cJSON *mb = cJSON_GetArrayItem(params, 4);
-    cJSON *ver = cJSON_GetArrayItem(params, 5);
-    cJSON *nbits = cJSON_GetArrayItem(params, 6);
-    cJSON *ntime = cJSON_GetArrayItem(params, 7);
-    cJSON *clean = cJSON_GetArrayItem(params, 8);
-    snprintf(s->job_id, sizeof(s->job_id), "%s", jid->valuestring);
-    hex_to_bin(s->prevhash, prev->valuestring, 32);
-    snprintf(s->coinb1_hex, sizeof(s->coinb1_hex), "%s", cb1->valuestring);
-    snprintf(s->coinb2_hex, sizeof(s->coinb2_hex), "%s", cb2->valuestring);
-    s->merkle_count = cJSON_GetArraySize(mb);
-    if (s->merkle_count > 32) s->merkle_count = 32;
-    for (int i = 0; i < s->merkle_count; i++) {
-        cJSON *h = cJSON_GetArrayItem(mb, i);
-        hex_to_bin(s->merkle[i], h->valuestring, 32);
+static int stratum_handle_notify(stratum_t *s, const char *line) {
+    gbtc_stratum_job_t job;
+    char reason[256] = "";
+    if (gbtc_parse_notify(line, &job, reason, sizeof(reason)) != 0) {
+        LOG("stratum: rejected mining.notify: %s", reason);
+        return -1;
     }
-    uint8_t buf[4];
-    hex_to_bin(buf, ver->valuestring, 4);
-    s->version_be = ((uint32_t)buf[0]<<24)|((uint32_t)buf[1]<<16)|((uint32_t)buf[2]<<8)|buf[3];
-    hex_to_bin(buf, nbits->valuestring, 4);
-    s->nbits_be = ((uint32_t)buf[0]<<24)|((uint32_t)buf[1]<<16)|((uint32_t)buf[2]<<8)|buf[3];
-    hex_to_bin(buf, ntime->valuestring, 4);
-    s->ntime_be = ((uint32_t)buf[0]<<24)|((uint32_t)buf[1]<<16)|((uint32_t)buf[2]<<8)|buf[3];
-    s->clean = cJSON_IsTrue(clean);
+    snprintf(s->job_id, sizeof(s->job_id), "%s", job.job_id);
+    memcpy(s->prevhash, job.prevhash, sizeof(s->prevhash));
+    snprintf(s->coinb1_hex, sizeof(s->coinb1_hex), "%s", job.coinb1_hex);
+    snprintf(s->coinb2_hex, sizeof(s->coinb2_hex), "%s", job.coinb2_hex);
+    s->merkle_count = (int)job.merkle_count;
+    memcpy(s->merkle, job.merkle, job.merkle_count * sizeof(job.merkle[0]));
+    s->version_be = job.version_be;
+    s->nbits_be = job.nbits_be;
+    s->ntime_be = job.ntime_be;
+    s->clean = job.clean;
     s->have_job = true;
     LOG("notify: job=%s ntime=%08x nbits=%08x clean=%d merkle_branches=%d",
         s->job_id, s->ntime_be, s->nbits_be, s->clean, s->merkle_count);
@@ -297,71 +329,108 @@ static void stratum_handle_notify(stratum_t *s, cJSON *params) {
     g_current_nbits = s->nbits_be;
     g_merkle_branches = s->merkle_count;
     pthread_mutex_unlock(&m_mu);
+    return 0;
 }
 
 static int stratum_subscribe_authorize(stratum_t *s) {
-    char msg[512];
-    snprintf(msg, sizeof(msg),
-        "{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"gamble-btc/0.1\"]}",
-        s->next_id++);
-    if (stratum_send(s, msg) < 0) return -1;
-    char *line;
-    while ((line = stratum_readline(s, 10000))) {
-        cJSON *root = cJSON_Parse(line);
-        if (!root) continue;
-        cJSON *result = cJSON_GetObjectItem(root, "result");
-        cJSON *id = cJSON_GetObjectItem(root, "id");
-        if (cJSON_IsArray(result) && cJSON_IsNumber(id) && id->valueint == 1) {
-            // result = [[subscriptions...], extranonce1_hex, extranonce2_size]
-            cJSON *en1 = cJSON_GetArrayItem(result, 1);
-            cJSON *en2sz = cJSON_GetArrayItem(result, 2);
-            snprintf(s->extranonce1, sizeof(s->extranonce1), "%s", en1->valuestring);
-            s->extranonce1_len = strlen(en1->valuestring) / 2;
-            s->extranonce2_size = en2sz->valueint;
-            LOG("subscribe: extranonce1=%s en2_size=%d", s->extranonce1, s->extranonce2_size);
-            cJSON_Delete(root);
-            break;
-        }
-        cJSON_Delete(root);
+    int subscribe_id = s->next_id++;
+    cJSON *subscribe_params = cJSON_CreateArray();
+    if (!subscribe_params || !cJSON_AddItemToArray(subscribe_params, cJSON_CreateString("gamble-btc/0.2")) ||
+        stratum_send_method(s, subscribe_id, "mining.subscribe", subscribe_params) < 0) return -1;
+    char *line = stratum_readline(s, 10000);
+    gbtc_stratum_subscription_t subscription;
+    char reason[256] = "";
+    if (!line || gbtc_parse_subscribe_response(line, subscribe_id, &subscription,
+                                                reason, sizeof(reason)) != 0) {
+        LOG("stratum: subscribe rejected: %s", line ? reason : "timeout or connection closed");
+        return -1;
     }
-    snprintf(msg, sizeof(msg),
-        "{\"id\":%d,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}",
-        s->next_id++, s->username, s->password);
-    if (stratum_send(s, msg) < 0) return -1;
+    snprintf(s->extranonce1, sizeof(s->extranonce1), "%s", subscription.extranonce1);
+    s->extranonce1_len = subscription.extranonce1_len;
+    s->extranonce2_size = subscription.extranonce2_size;
+    LOG("subscribe: extranonce1=%s en2_size=%zu", s->extranonce1, s->extranonce2_size);
+
+    int authorize_id = s->next_id++;
+    cJSON *authorize_params = cJSON_CreateArray();
+    if (!authorize_params ||
+        !cJSON_AddItemToArray(authorize_params, cJSON_CreateString(s->username)) ||
+        !cJSON_AddItemToArray(authorize_params, cJSON_CreateString(s->password)) ||
+        stratum_send_method(s, authorize_id, "mining.authorize", authorize_params) < 0) return -1;
+    line = stratum_readline(s, 10000);
+    bool authorized = false;
+    if (!line || gbtc_parse_boolean_response(line, authorize_id, &authorized,
+                                              reason, sizeof(reason)) != 0 || !authorized) {
+        LOG("stratum: authorization denied or malformed: %s",
+            line ? (reason[0] ? reason : "pool returned false") : "timeout or connection closed");
+        return -1;
+    }
     LOG("authorized as %s", s->username);
     return 0;
+}
+
+static int pending_submit_take(stratum_t *s, int id)
+{
+    for (size_t i = 0; i < s->pending_submit_count; i++) {
+        if (s->pending_submit_ids[i] == id) {
+            s->pending_submit_ids[i] = s->pending_submit_ids[s->pending_submit_count - 1u];
+            s->pending_submit_count--;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 static void stratum_pump(stratum_t *s, int timeout_ms) {
     char *line = stratum_readline(s, timeout_ms);
     if (!line) return;
-    cJSON *root = cJSON_Parse(line);
-    if (!root) return;
-    cJSON *method = cJSON_GetObjectItem(root, "method");
-    cJSON *params = cJSON_GetObjectItem(root, "params");
+    const char *end = NULL;
+    cJSON *root = cJSON_ParseWithLengthOpts(line, strlen(line) + 1u, &end, 1);
+    if (!root || !cJSON_IsObject(root)) {
+        LOG("stratum: rejected malformed JSON message");
+        cJSON_Delete(root);
+        return;
+    }
+    cJSON *method = cJSON_GetObjectItemCaseSensitive(root, "method");
     if (cJSON_IsString(method)) {
         if (strcmp(method->valuestring, "mining.notify") == 0) {
-            stratum_handle_notify(s, params);
+            stratum_handle_notify(s, line);
         } else if (strcmp(method->valuestring, "mining.set_difficulty") == 0) {
-            cJSON *d = cJSON_GetArrayItem(params, 0);
-            if (cJSON_IsNumber(d)) {
-                s->diff = d->valuedouble;
+            double difficulty = 0;
+            uint32_t target[8];
+            char reason[256] = "";
+            if (gbtc_parse_set_difficulty(line, &difficulty, target, reason, sizeof(reason)) == 0) {
+                s->diff = difficulty;
+                memcpy(s->target, target, sizeof(s->target));
+                s->target_generation++;
                 LOG("set_difficulty %f", s->diff);
                 pthread_mutex_lock(&m_mu);
                 g_current_diff = s->diff;
                 pthread_mutex_unlock(&m_mu);
+            } else {
+                LOG("stratum: rejected mining.set_difficulty: %s", reason);
             }
+        } else {
+            LOG("stratum: ignored unsupported method %s", method->valuestring);
         }
     } else {
-        cJSON *result = cJSON_GetObjectItem(root, "result");
-        cJSON *err = cJSON_GetObjectItem(root, "error");
-        if (cJSON_IsBool(result)) {
-            LOG("submit response: result=%d err=%s",
-                cJSON_IsTrue(result),
-                cJSON_IsNull(err) ? "null" : (cJSON_IsArray(err) ? cJSON_PrintUnformatted(err) : "?"));
-            pthread_mutex_lock(&m_mu);
-            if (cJSON_IsTrue(result)) g_accepted++; else g_rejected++;
-            pthread_mutex_unlock(&m_mu);
+        cJSON *id_item = cJSON_GetObjectItemCaseSensitive(root, "id");
+        if (cJSON_IsNumber(id_item) && isfinite(id_item->valuedouble) &&
+            floor(id_item->valuedouble) == id_item->valuedouble &&
+            id_item->valuedouble >= 0 && id_item->valuedouble <= INT_MAX) {
+            int id = (int)id_item->valuedouble;
+            bool accepted = false;
+            char reason[256] = "";
+            if (pending_submit_take(s, id) == 0 &&
+                gbtc_parse_boolean_response(line, id, &accepted, reason, sizeof(reason)) == 0) {
+                LOG("submit response: id=%d result=%d", id, accepted);
+                pthread_mutex_lock(&m_mu);
+                if (accepted) g_accepted++; else g_rejected++;
+                pthread_mutex_unlock(&m_mu);
+            } else {
+                LOG("stratum: rejected unexpected or malformed response id=%d", id);
+            }
+        } else {
+            LOG("stratum: rejected response with invalid id");
         }
     }
     cJSON_Delete(root);
@@ -369,21 +438,34 @@ static void stratum_pump(stratum_t *s, int timeout_ms) {
 
 static int stratum_submit(stratum_t *s, const char *job_id, const char *en2_hex,
                            uint32_t ntime_be, uint32_t nonce_be) {
-    char msg[1024];
-    snprintf(msg, sizeof(msg),
-        "{\"id\":%d,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%08x\",\"%08x\"]}",
-        s->next_id++, s->username, job_id, en2_hex, ntime_be, nonce_be);
-    LOG("SUBMIT: %s", msg);
+    if (s->pending_submit_count >= sizeof(s->pending_submit_ids) / sizeof(s->pending_submit_ids[0])) {
+        LOG("stratum: too many pending share responses");
+        return -1;
+    }
+    int id = s->next_id++;
+    char ntime[9], nonce[9];
+    snprintf(ntime, sizeof(ntime), "%08x", ntime_be);
+    snprintf(nonce, sizeof(nonce), "%08x", nonce_be);
+    cJSON *params = cJSON_CreateArray();
+    if (!params || !cJSON_AddItemToArray(params, cJSON_CreateString(s->username)) ||
+        !cJSON_AddItemToArray(params, cJSON_CreateString(job_id)) ||
+        !cJSON_AddItemToArray(params, cJSON_CreateString(en2_hex)) ||
+        !cJSON_AddItemToArray(params, cJSON_CreateString(ntime)) ||
+        !cJSON_AddItemToArray(params, cJSON_CreateString(nonce)) ||
+        stratum_send_method(s, id, "mining.submit", params) < 0) return -1;
+    s->pending_submit_ids[s->pending_submit_count++] = id;
+    LOG("SUBMIT: id=%d job=%s ntime=%s nonce=%s", id, job_id, ntime, nonce);
     pthread_mutex_lock(&m_mu);
     g_submitted++;
     pthread_mutex_unlock(&m_mu);
-    return stratum_send(s, msg);
+    return 0;
 }
 
 // ============================================================================
 // Work building (coinbase + merkle root + header midstate)
 // ============================================================================
-static void compute_merkle_root(uint8_t mr[32], const stratum_t *s, const uint8_t *en2, int en2_len) {
+static void compute_merkle_root(uint8_t mr[32], const stratum_t *s,
+                                const uint8_t *en2, size_t en2_len) {
     uint8_t cb1[1024], cb2[1024];
     int cb1_len = strlen(s->coinb1_hex) / 2;
     int cb2_len = strlen(s->coinb2_hex) / 2;
@@ -392,7 +474,7 @@ static void compute_merkle_root(uint8_t mr[32], const stratum_t *s, const uint8_
     uint8_t en1[32];
     hex_to_bin(en1, s->extranonce1, s->extranonce1_len);
     uint8_t coinbase[2048];
-    int p = 0;
+    size_t p = 0;
     memcpy(coinbase + p, cb1, cb1_len); p += cb1_len;
     memcpy(coinbase + p, en1, s->extranonce1_len); p += s->extranonce1_len;
     memcpy(coinbase + p, en2, en2_len); p += en2_len;
@@ -473,8 +555,9 @@ static char g_fallback_reason[256] = "";
 typedef struct {
     uint32_t midstate[8];
     uint32_t tail3[3];
+    uint32_t target_word0;
     uint32_t nonce_base;
-    uint32_t pad[3];
+    uint32_t pad[2];
 } shader_in_t;
 
 typedef struct {
@@ -701,6 +784,7 @@ static int gles_run_batch(const gbtc_work_batch_t *work, gbtc_backend_result_t *
     shader_in_t in = {0};
     memcpy(in.midstate, work->midstate, sizeof(in.midstate));
     memcpy(in.tail3, work->tail3, sizeof(in.tail3));
+    in.target_word0 = work->target[0];
     in.nonce_base = work->nonce_base;
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_in);
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(in), &in);
@@ -770,6 +854,8 @@ uint32_t g_current_ntime, g_current_nbits;
 int      g_merkle_branches;
 static char     g_pool_url[256], g_worker[64], g_btc_addr[128];
 
+#define STATUS_JSON_CAP 32768u
+
 static void metrics_push(double mh) {
     pthread_mutex_lock(&m_mu);
     m_samples[m_head] = mh;
@@ -831,6 +917,26 @@ static int build_stats_json(char *buf, size_t cap, bool include_history) {
     double prob_per_day = (net_hashrate > 0 && your_h > 0) ? your_h / net_hashrate * 144.0 : 0;
     // Probability of >=1 block within next 24h (Poisson): 1 - exp(-lambda)
     double prob_24h = 1.0 - exp(-prob_per_day);
+    char job[385], pool[1537], worker[385], addr[769];
+    char backend[193], backend_api[193], device_path[769], device_vendor[769];
+    char device_name[1537], driver_name[1537], fallback_reason[1537];
+    char escape_reason[128] = "";
+    if (gbtc_json_escape(g_current_job, job, sizeof(job), escape_reason, sizeof(escape_reason)) != 0 ||
+        gbtc_json_escape(g_pool_url, pool, sizeof(pool), escape_reason, sizeof(escape_reason)) != 0 ||
+        gbtc_json_escape(g_worker, worker, sizeof(worker), escape_reason, sizeof(escape_reason)) != 0 ||
+        gbtc_json_escape(g_btc_addr, addr, sizeof(addr), escape_reason, sizeof(escape_reason)) != 0 ||
+        gbtc_json_escape(g_backend, backend, sizeof(backend), escape_reason, sizeof(escape_reason)) != 0 ||
+        gbtc_json_escape(g_backend_api, backend_api, sizeof(backend_api), escape_reason, sizeof(escape_reason)) != 0 ||
+        gbtc_json_escape(g_device_path, device_path, sizeof(device_path), escape_reason, sizeof(escape_reason)) != 0 ||
+        gbtc_json_escape(g_device_vendor, device_vendor, sizeof(device_vendor), escape_reason, sizeof(escape_reason)) != 0 ||
+        gbtc_json_escape(g_device_name, device_name, sizeof(device_name), escape_reason, sizeof(escape_reason)) != 0 ||
+        gbtc_json_escape(g_driver_name, driver_name, sizeof(driver_name), escape_reason, sizeof(escape_reason)) != 0 ||
+        gbtc_json_escape(g_fallback_reason, fallback_reason, sizeof(fallback_reason),
+                         escape_reason, sizeof(escape_reason)) != 0) {
+        int failed = snprintf(buf, cap, "{\"error\":\"status serialization failed\"}");
+        pthread_mutex_unlock(&m_mu);
+        return failed > 0 && (size_t)failed < cap ? failed : 0;
+    }
     int n = snprintf(buf, cap,
         "{\"mh\":%.3f,\"min\":%.3f,\"max\":%.3f,\"avg\":%.3f,\"samples\":%d,"
         "\"uptime\":%ld,\"submitted\":%llu,\"accepted\":%llu,\"rejected\":%llu,"
@@ -844,10 +950,10 @@ static int build_stats_json(char *buf, size_t cap, bool include_history) {
         g_last_mh, g_min_mh, g_max_mh, g_avg_mh, m_count,
         uptime, (unsigned long long)g_submitted, (unsigned long long)g_accepted,
         (unsigned long long)g_rejected, (unsigned long long)g_lifetime_hashes,
-        g_current_diff, g_current_job, g_current_ntime, g_current_nbits,
-        g_merkle_branches, g_pool_url, g_worker, g_btc_addr,
-        g_backend, g_backend_api, g_device_path, g_device_vendor, g_device_name,
-        g_driver_name, g_fallback_reason,
+        g_current_diff, job, g_current_ntime, g_current_nbits,
+        g_merkle_branches, pool, worker, addr,
+        backend, backend_api, device_path, device_vendor, device_name,
+        driver_name, fallback_reason,
         net_diff, net_hashrate, eta_block_s, prob_per_day, prob_24h);
     if (include_history && n > 0 && (size_t)n < cap) {
         n += snprintf(buf + n, cap - n, ",\"history\":[");
@@ -1041,7 +1147,7 @@ static void *sse_client_thread(void *arg) {
     if (write_all(fd, hdr, strlen(hdr)) < 0) goto out;
 
     // Initial snapshot with full history
-    char buf[8192];
+    char buf[STATUS_JSON_CAP];
     int n = snprintf(buf, sizeof(buf), "data: ");
     n += build_stats_json(buf + n, sizeof(buf) - n, true);
     n += snprintf(buf + n, sizeof(buf) - n, "\n\n");
@@ -1057,7 +1163,7 @@ static void *sse_client_thread(void *arg) {
         while (m_seq == seen) pthread_cond_wait(&m_cv, &m_mu);
         seen = m_seq;
         pthread_mutex_unlock(&m_mu);
-        char line[8192];
+        char line[STATUS_JSON_CAP];
         int len = snprintf(line, sizeof(line), "data: ");
         len += build_stats_json(line + len, sizeof(line) - len, false);
         len += snprintf(line + len, sizeof(line) - len, "\n\n");
@@ -1115,15 +1221,23 @@ static void *http_thread(void *unused) {
     int yes = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     struct sockaddr_in a = {0};
+    char bind_address[INET_ADDRSTRLEN];
+    char bind_reason[128] = "";
+    if (gbtc_parse_http_bind(getenv("GBTC_HTTP_BIND"), &a.sin_addr,
+                             bind_address, sizeof(bind_address),
+                             bind_reason, sizeof(bind_reason)) != 0) {
+        LOG("http: %s", bind_reason);
+        close(srv);
+        return NULL;
+    }
     a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_ANY);
     a.sin_port = htons(41174);
     if (bind(srv, (struct sockaddr*)&a, sizeof(a)) < 0) {
         LOG("http: bind 41174 fail: %s", strerror(errno));
         close(srv); return NULL;
     }
     if (listen(srv, 16) < 0) { LOG("http: listen fail"); close(srv); return NULL; }
-    LOG("http: listening on 0.0.0.0:41174");
+    LOG("http: listening on %s:41174", bind_address);
     while (!g_stop) {
         struct sockaddr_in peer = {0};
         socklen_t peer_len = sizeof(peer);
@@ -1168,7 +1282,7 @@ static void *http_thread(void *unused) {
                 close(c);
             }
         } else if ((is_get || is_head) && http_path_is(path, "/status.json")) {
-            char body[8192];
+            char body[STATUS_JSON_CAP];
             int blen = build_stats_json(body, sizeof(body), true);
             http_send_body(c, "200 OK", "application/json",
                            body, (size_t)blen, is_get);
@@ -1599,7 +1713,7 @@ int main(void) {
     time_t t_last = time(NULL);
     struct timespec t_batch_prev;
     clock_gettime(CLOCK_MONOTONIC, &t_batch_prev);
-    uint32_t en2_counter = 0;
+    uint64_t en2_counter = 0;
     const uint32_t BATCH_NONCES = parse_batch_nonces(active_dispatch_quantum(backend));
 
     while (!g_stop) {
@@ -1609,8 +1723,10 @@ int main(void) {
 
         // Build current work: pick fresh extranonce2
         uint8_t en2[8] = {0};
-        int en2_len = S.extranonce2_size;
-        for (int i = 0; i < en2_len; i++) en2[i] = (en2_counter >> (8*i)) & 0xff;
+        size_t en2_len = S.extranonce2_size;
+        for (size_t i = 0; i < en2_len; i++) {
+            en2[i] = (uint8_t)(en2_counter >> (8u * i));
+        }
         en2_counter++;
 
         uint8_t merkle_root[32];
@@ -1618,12 +1734,14 @@ int main(void) {
 
         gbtc_work_batch_t work = {0};
         build_header_midstate(work.midstate, work.tail3, &S, merkle_root);
+        memcpy(work.target, S.target, sizeof(work.target));
 
         char en2_hex[32];
         bin_to_hex(en2_hex, en2, en2_len);
         char job_id_snapshot[64];
         snprintf(job_id_snapshot, sizeof(job_id_snapshot), "%s", S.job_id);
         uint32_t ntime_snapshot = S.ntime_be;
+        uint64_t target_generation_snapshot = S.target_generation;
 
         // Sweep full 2^32 nonce range until new job arrives.
         // (1<<32) / BATCH_NONCES = 2^32 / 2^24 = 256 batches per ntime cycle
@@ -1639,7 +1757,15 @@ int main(void) {
             }
 
             for (uint32_t i = 0; i < result.count; i++) {
-                stratum_submit(&S, job_id_snapshot, en2_hex, ntime_snapshot, result.nonces[i]);
+                uint8_t candidate_hash[32];
+                gbtc_work_hash(candidate_hash, &work, result.nonces[i]);
+                if (gbtc_raw_hash_meets_target(candidate_hash, work.target)) {
+                    stratum_submit(&S, job_id_snapshot, en2_hex,
+                                   ntime_snapshot, result.nonces[i]);
+                } else {
+                    LOG("candidate nonce=%08x failed full share-target comparison",
+                        result.nonces[i]);
+                }
             }
 
             total_hashes += result.hashes_done;
@@ -1665,6 +1791,10 @@ int main(void) {
 
             // Check for new job mid-sweep
             stratum_pump(&S, 0);
+            if (S.target_generation != target_generation_snapshot) {
+                LOG("difficulty changed, abandoning sweep");
+                break;
+            }
             if (strcmp(S.job_id, job_id_snapshot) != 0 && S.clean) {
                 LOG("new job, abandoning sweep");
                 break;

@@ -87,6 +87,8 @@ void gbtc_make_synthetic_work(gbtc_work_batch_t *work, uint32_t nonce_count)
     }
     work->nonce_base = 0;
     work->nonce_count = nonce_count;
+    work->target[0] = 0x00000000u;
+    work->target[1] = 0xffff0000u;
 }
 
 static void put_be32(uint8_t *dst, uint32_t value)
@@ -97,7 +99,7 @@ static void put_be32(uint8_t *dst, uint32_t value)
     dst[3] = (uint8_t)value;
 }
 
-uint32_t gbtc_reference_final_word7(const gbtc_work_batch_t *work, uint32_t nonce)
+void gbtc_work_hash(uint8_t final_hash[32], const gbtc_work_batch_t *work, uint32_t nonce)
 {
     uint8_t block[64] = {0};
     put_be32(block + 0, work->tail3[0]);
@@ -116,8 +118,13 @@ uint32_t gbtc_reference_final_word7(const gbtc_work_batch_t *work, uint32_t nonc
         put_be32(first_hash + 4 * i, state[i]);
     }
 
-    uint8_t final_hash[32];
     gbtc_sha256(final_hash, first_hash, sizeof(first_hash));
+}
+
+uint32_t gbtc_reference_final_word7(const gbtc_work_batch_t *work, uint32_t nonce)
+{
+    uint8_t final_hash[32];
+    gbtc_work_hash(final_hash, work, nonce);
     return ((uint32_t)final_hash[28] << 24) |
            ((uint32_t)final_hash[29] << 16) |
            ((uint32_t)final_hash[30] << 8) |

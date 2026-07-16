@@ -134,7 +134,8 @@ static int test_build_kernel_sources(void)
         return 1;
     }
     failures += expect_contains("unrolled-local-size", src, "layout(local_size_x = 128) in;");
-    failures += expect_contains("unrolled-target", src, "final_h7 == 0u");
+    failures += expect_contains("target-input", src, "uint target_word0;");
+    failures += expect_contains("unrolled-target", src, "BSWAP32(final_h7) <= I.target_word0");
     free(src);
 
     cfg.kernel = GBTC_GLES_KERNEL_ALTBOOL;
@@ -158,6 +159,8 @@ static int test_build_kernel_sources(void)
     failures += expect_contains("dualnonce-first", src, "uint nonce0 = I.nonce_base + global_idx * 2u;");
     failures += expect_contains("dualnonce-second", src, "uint nonce1 = nonce0 + 1u;");
     failures += expect_contains("dualnonce-store-second", src, "O.nonces[idx] = nonce1;");
+    failures += expect_contains("dualnonce-target", src,
+                                "BSWAP32(final_word7(nonce)) <= I.target_word0");
     free(src);
 
     return failures;

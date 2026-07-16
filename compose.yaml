@@ -9,6 +9,8 @@ services:
       GBTC_BACKEND: ${GBTC_BACKEND:-auto}
       GBTC_PROBE_ONLY: ${GBTC_PROBE_ONLY:-0}
       GBTC_DEVICE: ${GBTC_DEVICE:-/dev/dri/renderD128}
+      # Container must listen beyond loopback for Docker port forwarding.
+      GBTC_HTTP_BIND: 0.0.0.0
       GBTC_BATCH_NONCES: ${GBTC_BATCH_NONCES:-16777216}
       GBTC_BENCH_ONLY: ${GBTC_BENCH_ONLY:-0}
       GBTC_BENCH_SECONDS: ${GBTC_BENCH_SECONDS:-60}
@@ -24,5 +26,5 @@ services:
       - "983"
       - "987"
     ports:
-      - "0.0.0.0:41174:41174"
+      - "${GBTC_STATUS_BIND:-127.0.0.1}:41174:41174"
     mem_limit: 1g

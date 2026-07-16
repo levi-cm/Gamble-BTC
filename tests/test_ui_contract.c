@@ -55,6 +55,9 @@ int main(void)
     failures += expect_contains(src, "id=rig_title");
     failures += expect_contains(src, "waiting for stratum job");
     failures += expect_contains(src, "o.job!=null");
+    failures += expect_contains(src, "gbtc_json_escape(");
+    failures += expect_contains(src, "GBTC_HTTP_BIND");
+    failures += expect_contains(src, ".textContent=");
     failures += expect_contains(src, "stratum+tcp://public-pool.io:3333");
     if (strstr(src, "stratum+tcp://public-pool.io:21496")) {
         fprintf(stderr, "runtime fallback still uses old public-pool port\n");

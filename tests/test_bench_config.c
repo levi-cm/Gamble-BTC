@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 static int expect_i64(const char *name, int64_t got, int64_t want)
 {
@@ -100,6 +101,14 @@ int main(void)
         fprintf(stderr, "reference scan did not report odd nonce %u\n", odd_nonce);
         failures++;
     }
+
+    uint8_t full_hash[32];
+    gbtc_work_hash(full_hash, &work, even_nonce);
+    uint32_t full_hash_word7 = ((uint32_t)full_hash[28] << 24) |
+                               ((uint32_t)full_hash[29] << 16) |
+                               ((uint32_t)full_hash[30] << 8) |
+                               (uint32_t)full_hash[31];
+    failures += expect_u32("full-hash-word7", full_hash_word7, even_word);
 
     return failures ? 1 : 0;
 }
