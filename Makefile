@@ -9,7 +9,7 @@ SRC := src/main.c src/sha256.c src/backend.c src/gles_tuning.c src/bench.c src/s
 OBJ := $(SRC:src/%.c=build/%.o)
 TEST_BINS := build/test_sha256 build/test_backend_selection build/test_gles_tuning build/test_bench_config build/test_ui_contract build/test_stratum_protocol build/test_http_config
 
-.PHONY: all test test-asan test-ubsan static-analysis clean
+.PHONY: all test test-scripts test-asan test-ubsan static-analysis clean
 
 all: miner
 
@@ -48,7 +48,7 @@ build/test_http_config: tests/test_http_config.c src/http_config.c src/http_conf
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) $< src/http_config.c -o $@ $(TEST_LDFLAGS)
 
-test: $(TEST_BINS)
+test: $(TEST_BINS) test-scripts
 	./build/test_sha256
 	./build/test_backend_selection
 	./build/test_gles_tuning
@@ -68,6 +68,9 @@ test-ubsan:
 static-analysis:
 	cppcheck --enable=warning,performance,portability --check-level=exhaustive --error-exitcode=1 \
 		--inline-suppr --suppress=missingIncludeSystem src tests
+
+test-scripts:
+	./tests/test_start_miner_script.sh
 
 clean:
 	rm -rf build miner

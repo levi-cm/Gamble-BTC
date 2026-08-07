@@ -97,10 +97,19 @@ Build and start the container:
 docker compose up -d --build
 ```
 
-Or start the finalized Iris Xe runtime directly from zsh:
+Or start the finalized Iris Xe runtime directly from zsh. This keeps the
+terminal open, prints the one-minute average hashrate every 60 seconds, and
+stops the container when you press Ctrl-C or close the terminal:
 
 ```sh
 scripts/start-miner.sh
+```
+
+To start it as a background container with the Docker restart policy and exit
+the script:
+
+```sh
+scripts/start-miner.sh --detach
 ```
 
 Follow logs:
@@ -145,6 +154,9 @@ Stop the container:
 docker compose down
 scripts/stop-miner.sh
 ```
+
+`scripts/stop-miner.sh` is only needed for detached/background runs; the default
+`scripts/start-miner.sh` session stops its own container on exit.
 
 ## Development
 
