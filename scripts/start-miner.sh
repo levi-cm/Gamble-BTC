@@ -10,6 +10,14 @@ dri_card="${GBTC_DRI_CARD:-/dev/dri/card1}"
 dri_render="${GBTC_DRI_RENDER:-/dev/dri/renderD128}"
 video_gid="${GBTC_VIDEO_GID:-983}"
 render_gid="${GBTC_RENDER_GID:-987}"
+# Tunables (same defaults as compose.yaml); override per run, e.g.
+# GBTC_BACKEND=opencl GBTC_OPENCL_LOCAL_SIZE=128 scripts/start-miner.sh
+backend="${GBTC_BACKEND:-gles}"
+gles_kernel="${GBTC_GLES_KERNEL:-altbool}"
+gles_local="${GBTC_GLES_LOCAL_SIZE:-16}"
+opencl_local="${GBTC_OPENCL_LOCAL_SIZE:-64}"
+batch_nonces="${GBTC_BATCH_NONCES:-16777216}"
+shader_cache="${GBTC_SHADER_CACHE:-$HOME/.cache/gbtc-mesa-shader-cache}"
 status_url="${GBTC_STATUS_URL:-http://127.0.0.1:41174/status.json}"
 monitor_interval="${GBTC_STATUS_INTERVAL:-60}"
 mode="monitor"
@@ -21,9 +29,10 @@ usage() {
 Usage: scripts/start-miner.sh [--dry-run|--probe|--detach]
 
 Starts the Gamble-BTC miner with the confirmed Iris Xe GLES settings:
-  GBTC_BACKEND=gles
+  GBTC_BACKEND=gles (override with GBTC_BACKEND=opencl for the OpenCL path)
   GBTC_GLES_KERNEL=altbool
   GBTC_GLES_LOCAL_SIZE=16
+  GBTC_OPENCL_LOCAL_SIZE=64
   GBTC_BATCH_NONCES=16777216
   MESA_NO_ERROR=1
 
@@ -235,17 +244,24 @@ if [[ ! -e "$dri_render" ]]; then
     printf 'missing DRM render device: %s\n' "$dri_render" >&2
     exit 1
 fi
+mkdir -p "$shader_cache"
 
 if [[ "$mode" == "probe" ]]; then
+    mkdir -p "$shader_cache"
     cmd=(
         docker run --rm --network host --env-file "$env_file"
         -e GBTC_PROBE_ONLY=1
-        -e GBTC_BACKEND=gles
+        -e GBTC_BACKEND="$backend"
         -e GBTC_DEVICE="$dri_render"
-        -e GBTC_GLES_KERNEL=altbool
-        -e GBTC_GLES_LOCAL_SIZE=16
-        -e GBTC_BATCH_NONCES=16777216
+        -e GBTC_GLES_KERNEL="$gles_kernel"
+        -e GBTC_GLES_LOCAL_SIZE="$gles_local"
+        -e GBTC_OPENCL_LOCAL_SIZE="$opencl_local"
+        -e GBTC_BATCH_NONCES="$batch_nonces"
         -e MESA_NO_ERROR=1
+        -e MESA_LOADER_DRIVER_OVERRIDE=iris
+        -e RUSTICL_ENABLE=iris
+        -e MESA_SHADER_CACHE_DIR=/home/miner/.cache/mesa_shader_cache
+        --volume "$shader_cache:/home/miner/.cache/mesa_shader_cache"
         --device "$dri_card:$dri_card"
         --device "$dri_render:$dri_render"
         --group-add "$video_gid"
@@ -267,12 +283,18 @@ cmd=(
     --env-file "$env_file"
     -e GBTC_PROBE_ONLY=0
     -e GBTC_BENCH_ONLY=0
-    -e GBTC_BACKEND=gles
+    -e GBTC_BACKEND="$backend"
     -e GBTC_DEVICE="$dri_render"
-    -e GBTC_GLES_KERNEL=altbool
-    -e GBTC_GLES_LOCAL_SIZE=16
-    -e GBTC_BATCH_NONCES=16777216
+    -e GBTC_GLES_KERNEL="$gles_kernel"
+    -e GBTC_GLES_LOCAL_SIZE="$gles_local"
+    -e GBTC_OPENCL_LOCAL_SIZE="$opencl_local"
+    -e GBTC_BATCH_NONCES="$batch_nonces"
     -e MESA_NO_ERROR=1
+    -e MESA_LOADER_DRIVER_OVERRIDE=iris
+    -e RUSTICL_ENABLE=iris
+    -e MESA_SHADER_CACHE_DIR=/home/miner/.cache/mesa_shader_cache
+    --volume "$shader_cache:/home/miner/.cache/mesa_shader_cache"
+    --memory 4g --memory-reservation 1g --cpus 4.0 --ulimit memlock=-1
     --device "$dri_card:$dri_card"
     --device "$dri_render:$dri_render"
     --group-add "$video_gid"

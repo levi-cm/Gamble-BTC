@@ -3,28 +3,47 @@ services:
     build: .
     image: gamble-btc:latest
     container_name: gamble-btc
-    restart: unless-stopped
-    env_file: .env
+    # Host device nodes move between boots (card0 vs card1); override with
+    # GBTC_DRI_CARD=/dev/dri/cardX when needed. renderD128 is usually stable.
+    devices:
+      - "${GBTC_DRI_CARD:-/dev/dri/card1}:/dev/dri/card1"
+      - "${GBTC_DRI_RENDER:-/dev/dri/renderD128}:/dev/dri/renderD128"
+    # Match this laptop (video=983, render=987); HD 4600 legacy was 44/992.
+    group_add:
+      - "${VIDEO_GID:-983}"
+      - "${RENDER_GID:-987}"
+    ports:
+      - "127.0.0.1:41174:41174"
+    env_file:
+      - .env
     environment:
-      GBTC_BACKEND: ${GBTC_BACKEND:-auto}
-      GBTC_PROBE_ONLY: ${GBTC_PROBE_ONLY:-0}
+      GBTC_BACKEND: ${GBTC_BACKEND:-gles}
       GBTC_DEVICE: ${GBTC_DEVICE:-/dev/dri/renderD128}
-      # Container must listen beyond loopback for Docker port forwarding.
-      GBTC_HTTP_BIND: 0.0.0.0
-      GBTC_BATCH_NONCES: ${GBTC_BATCH_NONCES:-16777216}
-      GBTC_BENCH_ONLY: ${GBTC_BENCH_ONLY:-0}
-      GBTC_BENCH_SECONDS: ${GBTC_BENCH_SECONDS:-60}
-      GBTC_BENCH_WARMUP_SECONDS: ${GBTC_BENCH_WARMUP_SECONDS:-5}
       GBTC_GLES_KERNEL: ${GBTC_GLES_KERNEL:-altbool}
       GBTC_GLES_LOCAL_SIZE: ${GBTC_GLES_LOCAL_SIZE:-16}
+      GBTC_OPENCL_LOCAL_SIZE: ${GBTC_OPENCL_LOCAL_SIZE:-64}
+      GBTC_BATCH_NONCES: ${GBTC_BATCH_NONCES:-16777216}
+      GBTC_BENCH_SECONDS: ${GBTC_BENCH_SECONDS:-60}
+      GBTC_BENCH_WARMUP_SECONDS: ${GBTC_BENCH_WARMUP_SECONDS:-5}
       GBTC_GLES_AUTOTUNE: ${GBTC_GLES_AUTOTUNE:-0}
-      MESA_NO_ERROR: ${MESA_NO_ERROR:-1}
-    devices:
-      - /dev/dri/card1:/dev/dri/card1
-      - /dev/dri/renderD128:/dev/dri/renderD128
-    group_add:
-      - "983"
-      - "987"
-    ports:
-      - "${GBTC_STATUS_BIND:-127.0.0.1}:41174:41174"
-    mem_limit: 1g
+      MESA_NO_ERROR: 1
+      MESA_LOADER_DRIVER_OVERRIDE: iris
+      MESA_SHADER_CACHE_DIR: /home/miner/.cache/mesa_shader_cache
+      MESA_SHADER_CACHE_MAX_SIZE: 1G
+      RUSTICL_ENABLE: iris
+    volumes:
+      - mesa-shader-cache:/home/miner/.cache/mesa_shader_cache
+    # Feeder/stratum/UI threads are light; cap CPU so the iGPU keeps thermal
+    # headroom. memlock unlimited for GPU buffer pinning.
+    cpus: "4.0"
+    mem_limit: 4g
+    mem_reservation: 1g
+    ulimits:
+      memlock: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    restart: unless-stopped
+
+volumes:
+  mesa-shader-cache:

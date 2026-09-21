@@ -12,9 +12,17 @@ RUN make \
 
 FROM debian:trixie-slim
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libegl1 libegl-mesa0 libgles2 libgl1-mesa-dri \
+# Mesa 26.x (backports) for the Iris Xe compiler path plus OpenCL ICD support.
+# Intel NEO is not packaged in Debian, so OpenCL comes from Mesa Rusticl
+# (mesa-opencl-icd), which the miner reaches via dlopen with no link-time deps.
+RUN printf 'Types: deb\nURIs: http://deb.debian.org/debian\nSuites: trixie-backports\nComponents: main contrib non-free\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n' \
+        > /etc/apt/sources.list.d/backports.sources \
+    && apt-get update && apt-get install -y --no-install-recommends -t trixie-backports \
+        libegl-mesa0 libgl1-mesa-dri mesa-opencl-icd \
+    && apt-get install -y --no-install-recommends \
+        libegl1 libgles2 \
         libcjson1 libdrm2 libdrm-intel1 libgbm1 \
+        ocl-icd-libopencl1 \
         ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd -g 992 render \
