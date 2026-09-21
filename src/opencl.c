@@ -1,0 +1,615 @@
+// gamble-btc OpenCL iGPU backend.
+//
+// Reached exclusively through dlopen("libOpenCL.so.1"), so the binary keeps
+// zero link-time OpenCL dependencies and runs on any ICD present in the
+// container (Mesa Rusticl, Intel NEO, ...). The compute kernel is the same
+// unrolled SHA-256d nonce scan as the GLES path: work-item i tests
+// nonce_base + i and reports matches through a shared counter.
+
+#include "opencl.h"
+#include "backend.h"
+
+#include <dlfcn.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// ---------------------------------------------------------------------------
+// Minimal OpenCL 1.2 declarations (no headers needed, dlopen only).
+// ---------------------------------------------------------------------------
+typedef int32_t cl_int;
+typedef uint32_t cl_uint;
+typedef uint64_t cl_ulong;
+typedef uint32_t cl_bool;
+typedef uint64_t cl_bitfield;
+typedef intptr_t cl_context_properties;
+typedef struct _cl_platform_id *cl_platform_id;
+typedef struct _cl_device_id *cl_device_id;
+typedef struct _cl_context *cl_context;
+typedef struct _cl_command_queue *cl_command_queue;
+typedef struct _cl_mem *cl_mem;
+typedef struct _cl_program *cl_program;
+typedef struct _cl_kernel *cl_kernel;
+typedef size_t cl_device_type;
+
+#define CL_SUCCESS 0
+#define CL_TRUE 1
+#define CL_FALSE 0
+#define CL_DEVICE_TYPE_GPU ((cl_device_type)(1 << 2))
+#define CL_MEM_READ_WRITE ((cl_bitfield)(1 << 0))
+#define CL_MEM_READ_ONLY ((cl_bitfield)(1 << 2))
+#define CL_PLATFORM_NAME 0x0902u
+#define CL_DEVICE_NAME 0x102Bu
+#define CL_DEVICE_VENDOR 0x102Cu
+#define CL_DEVICE_VERSION 0x102Fu
+#define CL_PROGRAM_BUILD_LOG 0x1183u
+#define CL_KERNEL_WORK_GROUP_SIZE 0x11B0u
+
+typedef struct {
+    void *handle;
+    cl_int (*GetPlatformIDs)(cl_uint, cl_platform_id *, cl_uint *);
+    cl_int (*GetPlatformInfo)(cl_platform_id, cl_uint, size_t, void *, size_t *);
+    cl_int (*GetDeviceIDs)(cl_platform_id, cl_device_type, cl_uint, cl_device_id *, cl_uint *);
+    cl_int (*GetDeviceInfo)(cl_device_id, cl_uint, size_t, void *, size_t *);
+    cl_context (*CreateContext)(const cl_context_properties *, cl_uint, const cl_device_id *,
+                                void (*)(const char *, const void *, size_t, void *),
+                                void *, cl_int *);
+    cl_command_queue (*CreateCommandQueue)(cl_context, cl_device_id, cl_bitfield, cl_int *);
+    cl_mem (*CreateBuffer)(cl_context, cl_bitfield, size_t, void *, cl_int *);
+    cl_program (*CreateProgramWithSource)(cl_context, cl_uint, const char **, const size_t *, cl_int *);
+    cl_int (*BuildProgram)(cl_program, cl_uint, const cl_device_id *, const char *,
+                           void (*)(cl_program, void *), void *);
+    cl_int (*GetProgramBuildInfo)(cl_program, cl_device_id, cl_uint, size_t, void *, size_t *);
+    cl_kernel (*CreateKernel)(cl_program, const char *, cl_int *);
+    cl_int (*SetKernelArg)(cl_kernel, cl_uint, size_t, const void *);
+    cl_int (*EnqueueWriteBuffer)(cl_command_queue, cl_mem, cl_bool, size_t, size_t,
+                                 const void *, cl_uint, const void *, void *);
+    cl_int (*EnqueueNDRangeKernel)(cl_command_queue, cl_kernel, cl_uint, const size_t *,
+                                   const size_t *, const size_t *, cl_uint, const void *, void *);
+    cl_int (*EnqueueReadBuffer)(cl_command_queue, cl_mem, cl_bool, size_t, size_t,
+                                void *, cl_uint, const void *, void *);
+    cl_int (*Finish)(cl_command_queue);
+    cl_int (*GetKernelWorkGroupInfo)(cl_kernel, cl_device_id, cl_uint, size_t, void *, size_t *);
+    cl_int (*ReleaseKernel)(cl_kernel);
+    cl_int (*ReleaseProgram)(cl_program);
+    cl_int (*ReleaseMemObject)(cl_mem);
+    cl_int (*ReleaseCommandQueue)(cl_command_queue);
+    cl_int (*ReleaseContext)(cl_context);
+} cl_api_t;
+
+static cl_api_t g_cl;
+static int g_cl_loaded = 0;
+
+static void *load_sym(void *handle, const char *name)
+{
+    dlerror();
+    void *sym = dlsym(handle, name);
+    return dlerror() == NULL ? sym : NULL;
+}
+
+static int cl_load(char *reason, size_t reason_cap)
+{
+    if (g_cl_loaded) return 0;
+    memset(&g_cl, 0, sizeof(g_cl));
+    void *handle = dlopen("libOpenCL.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        if (reason && reason_cap) {
+            snprintf(reason, reason_cap, "dlopen libOpenCL.so.1 failed: %s",
+                     dlerror() ? dlerror() : "unknown");
+        }
+        return -1;
+    }
+#define LOAD(fn)                                                        \
+    do {                                                                \
+        void *sym_ = load_sym(handle, "cl" #fn);                        \
+        if (!sym_) {                                                    \
+            if (reason && reason_cap)                                   \
+                snprintf(reason, reason_cap, "libOpenCL.so.1 has no cl" #fn); \
+            dlclose(handle);                                            \
+            return -1;                                                  \
+        }                                                               \
+        memcpy(&g_cl.fn, &sym_, sizeof(sym_));                          \
+    } while (0)
+    LOAD(GetPlatformIDs);
+    LOAD(GetPlatformInfo);
+    LOAD(GetDeviceIDs);
+    LOAD(GetDeviceInfo);
+    LOAD(CreateContext);
+    LOAD(CreateCommandQueue);
+    LOAD(CreateBuffer);
+    LOAD(CreateProgramWithSource);
+    LOAD(BuildProgram);
+    LOAD(GetProgramBuildInfo);
+    LOAD(CreateKernel);
+    LOAD(SetKernelArg);
+    LOAD(EnqueueWriteBuffer);
+    LOAD(EnqueueNDRangeKernel);
+    LOAD(EnqueueReadBuffer);
+    LOAD(Finish);
+    LOAD(GetKernelWorkGroupInfo);
+    LOAD(ReleaseKernel);
+    LOAD(ReleaseProgram);
+    LOAD(ReleaseMemObject);
+    LOAD(ReleaseCommandQueue);
+    LOAD(ReleaseContext);
+#undef LOAD
+    g_cl.handle = handle;
+    g_cl_loaded = 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Config.
+// ---------------------------------------------------------------------------
+#define GBTC_OPENCL_DEFAULT_LOCAL_SIZE 64u
+#define GBTC_OPENCL_SOURCE_CAP (256u * 1024u)
+
+void gbtc_opencl_config_defaults(gbtc_opencl_config_t *cfg)
+{
+    cfg->local_size = GBTC_OPENCL_DEFAULT_LOCAL_SIZE;
+    cfg->local_size_auto = 0;
+}
+
+const char *gbtc_opencl_kernel_name(void)
+{
+    return "ocl-unrolled";
+}
+
+uint32_t gbtc_opencl_batch_quantum(const gbtc_opencl_config_t *cfg)
+{
+    return cfg->local_size;
+}
+
+static int opencl_local_size_allowed(uint32_t v)
+{
+    return v == 8 || v == 16 || v == 32 || v == 64 ||
+           v == 128 || v == 256 || v == 512;
+}
+
+int gbtc_opencl_config_from_env(gbtc_opencl_config_t *cfg, char *reason, size_t reason_cap)
+{
+    gbtc_opencl_config_defaults(cfg);
+    const char *value = getenv("GBTC_OPENCL_LOCAL_SIZE");
+    if (!value || !value[0]) return 0;
+    if (strcmp(value, "auto") == 0) {
+        cfg->local_size_auto = 1;
+        return 0;
+    }
+    char *end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno || !end || *end != '\0' || parsed > UINT32_MAX ||
+        !opencl_local_size_allowed((uint32_t)parsed)) {
+        if (reason && reason_cap) {
+            snprintf(reason, reason_cap,
+                     "GBTC_OPENCL_LOCAL_SIZE must be auto, 8, 16, 32, 64, 128, 256, or 512");
+        }
+        return -1;
+    }
+    cfg->local_size = (uint32_t)parsed;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel source generation (unrolled SHA-256d, one nonce per work-item).
+//
+// Input:  I[0..7] midstate, I[8..10] header words 16..18, I[11] target word 0,
+//         I[12] nonce base, I[13..15] pad.
+// Output: O[0] match count, O[1..15] matching nonces.
+// ---------------------------------------------------------------------------
+typedef struct {
+    char *buf;
+    size_t cap;
+    size_t len;
+    int failed;
+} sb_t;
+
+static void sb_appendf(sb_t *sb, const char *fmt, ...)
+{
+    if (sb->failed || sb->len >= sb->cap) {
+        sb->failed = 1;
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(sb->buf + sb->len, sb->cap - sb->len, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= sb->cap - sb->len) {
+        sb->failed = 1;
+        return;
+    }
+    sb->len += (size_t)n;
+}
+
+static const uint32_t SHA_K[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+
+char *gbtc_opencl_build_kernel_src(char *reason, size_t reason_cap)
+{
+    char *buf = calloc(1, GBTC_OPENCL_SOURCE_CAP);
+    if (!buf) {
+        if (reason && reason_cap) snprintf(reason, reason_cap, "out of memory");
+        return NULL;
+    }
+    sb_t sb = { .buf = buf, .cap = GBTC_OPENCL_SOURCE_CAP, .len = 0, .failed = 0 };
+
+    sb_appendf(&sb,
+        "#define ROR(x,n) (((x)>>(n))|((x)<<(32u-(n))))\n"
+        "#define BIGSIG0(x) (ROR(x,2u)^ROR(x,13u)^ROR(x,22u))\n"
+        "#define BIGSIG1(x) (ROR(x,6u)^ROR(x,11u)^ROR(x,25u))\n"
+        "#define SMALLSIG0(x) (ROR(x,7u)^ROR(x,18u)^((x)>>3u))\n"
+        "#define SMALLSIG1(x) (ROR(x,17u)^ROR(x,19u)^((x)>>10u))\n"
+        "#define CH(x,y,z) (((x)&(y))^(~(x)&(z)))\n"
+        "#define MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))\n"
+        "#define BSWAP32(x) (((x)>>24u)|(((x)>>8u)&0x0000ff00u)|(((x)<<8u)&0x00ff0000u)|((x)<<24u))\n"
+        "__kernel void gbtc_mine(__global const uint *I, __global uint *O) {\n"
+        "  uint gid = get_global_id(0);\n"
+        "  uint nonce = I[12] + gid;\n"
+        "  uint t1, t2;\n"
+        "  uint w0 = I[8];\n"
+        "  uint w1 = I[9];\n"
+        "  uint w2 = I[10];\n"
+        "  uint w3 = nonce;\n"
+        "  uint w4 = 0x80000000u;\n"
+        "  uint w5 = 0u; uint w6 = 0u; uint w7 = 0u; uint w8 = 0u;\n"
+        "  uint w9 = 0u; uint w10 = 0u; uint w11 = 0u; uint w12 = 0u;\n"
+        "  uint w13 = 0u; uint w14 = 0u; uint w15 = 640u;\n"
+        "  uint a = I[0]; uint b = I[1]; uint c = I[2]; uint d = I[3];\n"
+        "  uint e = I[4]; uint f = I[5]; uint g = I[6]; uint h = I[7];\n");
+
+    const char *wnames[16] = {
+        "w0","w1","w2","w3","w4","w5","w6","w7",
+        "w8","w9","w10","w11","w12","w13","w14","w15"
+    };
+    for (int half = 0; half < 2; half++) {
+        const char *v[8] = {"a","b","c","d","e","f","g","h"};
+        if (half == 1) {
+            sb_appendf(&sb,
+                "  uint h1_0 = I[0] + %s;\n"
+                "  uint h1_1 = I[1] + %s;\n"
+                "  uint h1_2 = I[2] + %s;\n"
+                "  uint h1_3 = I[3] + %s;\n"
+                "  uint h1_4 = I[4] + %s;\n"
+                "  uint h1_5 = I[5] + %s;\n"
+                "  uint h1_6 = I[6] + %s;\n"
+                "  uint h1_7 = I[7] + %s;\n"
+                "  w0 = h1_0; w1 = h1_1; w2 = h1_2; w3 = h1_3;\n"
+                "  w4 = h1_4; w5 = h1_5; w6 = h1_6; w7 = h1_7;\n"
+                "  w8 = 0x80000000u; w9 = 0u; w10 = 0u; w11 = 0u;\n"
+                "  w12 = 0u; w13 = 0u; w14 = 0u; w15 = 256u;\n"
+                "  a = 0x6a09e667u; b = 0xbb67ae85u; c = 0x3c6ef372u; d = 0xa54ff53au;\n"
+                "  e = 0x510e527fu; f = 0x9b05688cu; g = 0x1f83d9abu; h = 0x5be0cd19u;\n",
+                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            // After the midstate add, the working variables hold the first-half
+            // digest words; reset the rotation tracker for the second half.
+            v[0]="a"; v[1]="b"; v[2]="c"; v[3]="d";
+            v[4]="e"; v[5]="f"; v[6]="g"; v[7]="h";
+        }
+        for (int t = 0; t < 64; t++) {
+            const char *wt;
+            if (t < 16) {
+                wt = wnames[t];
+            } else {
+                int s = t & 15;
+                int s2 = (t - 2) & 15;
+                int s7 = (t - 7) & 15;
+                int s15 = (t - 15) & 15;
+                sb_appendf(&sb, "  %s = %s + SMALLSIG0(%s) + %s + SMALLSIG1(%s);\n",
+                           wnames[s], wnames[s], wnames[s15], wnames[s7], wnames[s2]);
+                wt = wnames[s];
+            }
+            sb_appendf(&sb,
+                "  t1 = %s + BIGSIG1(%s) + CH(%s,%s,%s) + 0x%08xu + %s;\n"
+                "  t2 = BIGSIG0(%s) + MAJ(%s,%s,%s);\n"
+                "  %s = %s + t1; %s = t1 + t2;\n",
+                v[7], v[4], v[4], v[5], v[6], SHA_K[t], wt,
+                v[0], v[0], v[1], v[2],
+                v[3], v[3], v[7]);
+            const char *na = v[7], *ne = v[3];
+            v[7] = v[6]; v[6] = v[5]; v[5] = v[4]; v[4] = ne;
+            v[3] = v[2]; v[2] = v[1]; v[1] = v[0]; v[0] = na;
+        }
+        if (half == 0) {
+            // Stash first-half digest words in w0..w7 for the midstate add above.
+            sb_appendf(&sb,
+                "  w0 = I[0] + %s; w1 = I[1] + %s; w2 = I[2] + %s; w3 = I[3] + %s;\n"
+                "  w4 = I[4] + %s; w5 = I[5] + %s; w6 = I[6] + %s; w7 = I[7] + %s;\n",
+                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+        } else {
+            sb_appendf(&sb,
+                "  uint final_h7 = 0x5be0cd19u + %s;\n"
+                "  if (BSWAP32(final_h7) <= I[11]) {\n"
+                "    uint idx = atomic_inc(O);\n"
+                "    if (idx < 15u) O[idx + 1u] = nonce;\n"
+                "  }\n"
+                "}\n",
+                v[7]);
+        }
+    }
+
+    if (sb.failed) {
+        free(buf);
+        if (reason && reason_cap) snprintf(reason, reason_cap, "generated OpenCL source overflowed");
+        return NULL;
+    }
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Backend state.
+// ---------------------------------------------------------------------------
+static gbtc_opencl_config_t g_cfg;
+static cl_platform_id g_platform = NULL;
+static cl_device_id g_device = NULL;
+static cl_context g_ctx = NULL;
+static cl_command_queue g_queue = NULL;
+static cl_program g_program = NULL;
+static cl_kernel g_kernel = NULL;
+static cl_mem g_buf_in = NULL;
+static cl_mem g_buf_out = NULL;
+static char g_dev_info[512] = "";
+static char g_plat_name[256] = "";
+static char g_dev_name[256] = "";
+static char g_dev_ver[256] = "";
+
+static void set_reason(char *reason, size_t reason_cap, const char *fmt, ...)
+{
+    if (!reason || reason_cap == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(reason, reason_cap, fmt, ap);
+    va_end(ap);
+}
+
+uint32_t gbtc_opencl_active_local_size(void)
+{
+    return g_cfg.local_size;
+}
+
+void gbtc_opencl_device_strings(const char **vendor, const char **name,
+                                const char **version)
+{
+    // ICD loader exposes no separate vendor string here; reuse platform name.
+    if (vendor) *vendor = g_plat_name[0] ? g_plat_name : "OpenCL";
+    if (name) *name = g_dev_name[0] ? g_dev_name : "unknown";
+    if (version) *version = g_dev_ver[0] ? g_dev_ver : "unknown";
+}
+
+static int pick_gpu_device(char *reason, size_t reason_cap)
+{
+    cl_uint nplatforms = 0;
+    if (g_cl.GetPlatformIDs(0, NULL, &nplatforms) != CL_SUCCESS || nplatforms == 0) {
+        set_reason(reason, reason_cap, "no OpenCL platforms found");
+        return -1;
+    }
+    cl_platform_id *platforms = calloc(nplatforms, sizeof(*platforms));
+    if (!platforms) {
+        set_reason(reason, reason_cap, "out of memory");
+        return -1;
+    }
+    int rc = -1;
+    if (g_cl.GetPlatformIDs(nplatforms, platforms, NULL) != CL_SUCCESS) {
+        set_reason(reason, reason_cap, "clGetPlatformIDs failed");
+        goto out;
+    }
+    for (cl_uint p = 0; p < nplatforms; p++) {
+        cl_uint ndevs = 0;
+        if (g_cl.GetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, 0, NULL, &ndevs) != CL_SUCCESS ||
+            ndevs == 0) {
+            continue;
+        }
+        cl_device_id *devs = calloc(ndevs, sizeof(*devs));
+        if (!devs) {
+            set_reason(reason, reason_cap, "out of memory");
+            goto out;
+        }
+        if (g_cl.GetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, ndevs, devs, NULL) != CL_SUCCESS) {
+            free(devs);
+            continue;
+        }
+        char plat[256] = "", dev[256] = "", ver[256] = "";
+        size_t n = 0;
+        g_cl.GetPlatformInfo(platforms[p], CL_PLATFORM_NAME, sizeof(plat), plat, &n);
+        g_cl.GetDeviceInfo(devs[0], CL_DEVICE_NAME, sizeof(dev), dev, &n);
+        g_cl.GetDeviceInfo(devs[0], CL_DEVICE_VERSION, sizeof(ver), ver, &n);
+        snprintf(g_plat_name, sizeof(g_plat_name), "%s", plat[0] ? plat : "?");
+        snprintf(g_dev_name, sizeof(g_dev_name), "%s", dev[0] ? dev : "?");
+        snprintf(g_dev_ver, sizeof(g_dev_ver), "%s", ver[0] ? ver : "?");
+        snprintf(g_dev_info, sizeof(g_dev_info), "OpenCL %s / %s / %s",
+                 g_plat_name, g_dev_name, g_dev_ver);
+        g_platform = platforms[p];
+        g_device = devs[0];
+        free(devs);
+        rc = 0;
+        break;
+    }
+    if (rc != 0) set_reason(reason, reason_cap, "no OpenCL GPU device found");
+out:
+    free(platforms);
+    return rc;
+}
+
+static int opencl_probe(char *reason, size_t reason_cap)
+{
+    if (cl_load(reason, reason_cap) != 0) return -1;
+    char saved[sizeof(g_dev_info)];
+    snprintf(saved, sizeof(saved), "%s", g_dev_info);
+    cl_platform_id saved_plat = g_platform;
+    cl_device_id saved_dev = g_device;
+    if (pick_gpu_device(reason, reason_cap) != 0) return -1;
+    set_reason(reason, reason_cap, "%s", g_dev_info);
+    // Restore any previous pick; init() re-picks deterministically anyway.
+    snprintf(g_dev_info, sizeof(g_dev_info), "%s", saved);
+    g_platform = saved_plat;
+    g_device = saved_dev;
+    return 0;
+}
+
+static void opencl_shutdown(void)
+{
+    if (g_kernel) { g_cl.ReleaseKernel(g_kernel); g_kernel = NULL; }
+    if (g_program) { g_cl.ReleaseProgram(g_program); g_program = NULL; }
+    if (g_buf_in) { g_cl.ReleaseMemObject(g_buf_in); g_buf_in = NULL; }
+    if (g_buf_out) { g_cl.ReleaseMemObject(g_buf_out); g_buf_out = NULL; }
+    if (g_queue) { g_cl.ReleaseCommandQueue(g_queue); g_queue = NULL; }
+    if (g_ctx) { g_cl.ReleaseContext(g_ctx); g_ctx = NULL; }
+    g_platform = NULL;
+    g_device = NULL;
+}
+
+static int opencl_init(char *reason, size_t reason_cap)
+{
+    if (cl_load(reason, reason_cap) != 0) return -1;
+    if (gbtc_opencl_config_from_env(&g_cfg, reason, reason_cap) != 0) return -1;
+    opencl_shutdown();
+    if (pick_gpu_device(reason, reason_cap) != 0) return -1;
+
+    cl_int err = CL_SUCCESS;
+    g_ctx = g_cl.CreateContext(NULL, 1, &g_device, NULL, NULL, &err);
+    if (!g_ctx || err != CL_SUCCESS) {
+        set_reason(reason, reason_cap, "clCreateContext failed (%d)", err);
+        opencl_shutdown();
+        return -1;
+    }
+    g_queue = g_cl.CreateCommandQueue(g_ctx, g_device, 0, &err);
+    if (!g_queue || err != CL_SUCCESS) {
+        set_reason(reason, reason_cap, "clCreateCommandQueue failed (%d)", err);
+        opencl_shutdown();
+        return -1;
+    }
+
+    char *src = gbtc_opencl_build_kernel_src(reason, reason_cap);
+    if (!src) {
+        opencl_shutdown();
+        return -1;
+    }
+    const char *srcs[1] = { src };
+    g_program = g_cl.CreateProgramWithSource(g_ctx, 1, srcs, NULL, &err);
+    if (!g_program || err != CL_SUCCESS) {
+        set_reason(reason, reason_cap, "clCreateProgramWithSource failed (%d)", err);
+        free(src);
+        opencl_shutdown();
+        return -1;
+    }
+    err = g_cl.BuildProgram(g_program, 1, &g_device, "-cl-std=CL1.2", NULL, NULL);
+    if (err != CL_SUCCESS) {
+        char log[4096] = "";
+        size_t n = 0;
+        g_cl.GetProgramBuildInfo(g_program, g_device, CL_PROGRAM_BUILD_LOG,
+                                 sizeof(log) - 1, log, &n);
+        set_reason(reason, reason_cap, "OpenCL build failed (%d): %.*s",
+                   err, (int)sizeof(log) - 1, log);
+        free(src);
+        opencl_shutdown();
+        return -1;
+    }
+    free(src);
+
+    g_kernel = g_cl.CreateKernel(g_program, "gbtc_mine", &err);
+    if (!g_kernel || err != CL_SUCCESS) {
+        set_reason(reason, reason_cap, "clCreateKernel failed (%d)", err);
+        opencl_shutdown();
+        return -1;
+    }
+    size_t max_wg = 0;
+    if (g_cl.GetKernelWorkGroupInfo(g_kernel, g_device, CL_KERNEL_WORK_GROUP_SIZE,
+                                    sizeof(max_wg), &max_wg, NULL) != CL_SUCCESS || max_wg == 0) {
+        set_reason(reason, reason_cap, "clGetKernelWorkGroupInfo failed");
+        opencl_shutdown();
+        return -1;
+    }
+    if (g_cfg.local_size_auto) {
+        uint32_t v = 64;
+        while (v > max_wg && v > 8) v /= 2;
+        if (v > max_wg) {
+            set_reason(reason, reason_cap, "device max work-group size %zu too small", max_wg);
+            opencl_shutdown();
+            return -1;
+        }
+        g_cfg.local_size = v;
+    } else if (g_cfg.local_size > max_wg) {
+        set_reason(reason, reason_cap, "local_size %u exceeds device max %zu",
+                   g_cfg.local_size, max_wg);
+        opencl_shutdown();
+        return -1;
+    }
+
+    g_buf_in = g_cl.CreateBuffer(g_ctx, CL_MEM_READ_ONLY, 16 * sizeof(cl_uint), NULL, &err);
+    if (!g_buf_in || err != CL_SUCCESS) {
+        set_reason(reason, reason_cap, "input buffer failed (%d)", err);
+        opencl_shutdown();
+        return -1;
+    }
+    g_buf_out = g_cl.CreateBuffer(g_ctx, CL_MEM_READ_WRITE, 16 * sizeof(cl_uint), NULL, &err);
+    if (!g_buf_out || err != CL_SUCCESS) {
+        set_reason(reason, reason_cap, "output buffer failed (%d)", err);
+        opencl_shutdown();
+        return -1;
+    }
+    set_reason(reason, reason_cap, "OpenCL pipeline ready on %s (local_size=%u max_wg=%zu)",
+               g_dev_info, g_cfg.local_size, max_wg);
+    return 0;
+}
+
+static int opencl_run_batch(const gbtc_work_batch_t *work, gbtc_backend_result_t *result)
+{
+    if (!work || !result || !g_kernel || work->nonce_count == 0) return -1;
+    if ((work->nonce_count % g_cfg.local_size) != 0) return -1;
+
+    cl_uint in[16] = {0};
+    memcpy(in + 0, work->midstate, 8 * sizeof(cl_uint));
+    memcpy(in + 8, work->tail3, 3 * sizeof(cl_uint));
+    in[11] = work->target[0];
+    in[12] = work->nonce_base;
+    cl_uint zero = 0;
+    cl_int err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_in, CL_TRUE, 0, sizeof(in),
+                                         in, 0, NULL, NULL);
+    if (err != CL_SUCCESS) return -1;
+    err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_out, CL_TRUE, 0, sizeof(zero),
+                                  &zero, 0, NULL, NULL);
+    if (err != CL_SUCCESS) return -1;
+
+    err = g_cl.SetKernelArg(g_kernel, 0, sizeof(g_buf_in), &g_buf_in);
+    if (err != CL_SUCCESS) return -1;
+    err = g_cl.SetKernelArg(g_kernel, 1, sizeof(g_buf_out), &g_buf_out);
+    if (err != CL_SUCCESS) return -1;
+
+    size_t global = work->nonce_count;
+    size_t local = g_cfg.local_size;
+    err = g_cl.EnqueueNDRangeKernel(g_queue, g_kernel, 1, NULL, &global, &local,
+                                    0, NULL, NULL);
+    if (err != CL_SUCCESS) return -1;
+    if (g_cl.Finish(g_queue) != CL_SUCCESS) return -1;
+
+    cl_uint out[16] = {0};
+    err = g_cl.EnqueueReadBuffer(g_queue, g_buf_out, CL_TRUE, 0, sizeof(out),
+                                 out, 0, NULL, NULL);
+    if (err != CL_SUCCESS) return -1;
+
+    result->count = out[0];
+    if (result->count > GBTC_MAX_FOUND_NONCES) result->count = GBTC_MAX_FOUND_NONCES;
+    for (uint32_t i = 0; i < result->count; i++) result->nonces[i] = out[1 + i];
+    result->hashes_done = work->nonce_count;
+    return 0;
+}
+
+const gbtc_backend_t gbtc_opencl_backend = {
+    .kind = GBTC_BACKEND_OPENCL,
+    .name = "opencl",
+    .api = "opencl",
+    .probe = opencl_probe,
+    .init = opencl_init,
+    .run_batch = opencl_run_batch,
+    .shutdown = opencl_shutdown,
+};

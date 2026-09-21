@@ -68,12 +68,4 @@ const gbtc_backend_t gbtc_vulkan_backend = {
     .shutdown = unavailable_shutdown,
 };
 
-const gbtc_backend_t gbtc_opencl_backend = {
-    .kind = GBTC_BACKEND_OPENCL,
-    .name = "opencl",
-    .api = "opencl",
-    .probe = unavailable_probe,
-    .init = unavailable_init,
-    .run_batch = unavailable_run,
-    .shutdown = unavailable_shutdown,
-};
+// The OpenCL backend is implemented in src/opencl.c (gbtc_opencl_backend).

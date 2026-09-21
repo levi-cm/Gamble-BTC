@@ -8,6 +8,7 @@
 #include "bench.h"
 #include "backend.h"
 #include "gles_tuning.h"
+#include "opencl.h"
 #include "http_config.h"
 #include "stratum_protocol.h"
 
@@ -1359,10 +1360,12 @@ static void append_rejection(char *dst, size_t cap, const char *backend, const c
 
 static const gbtc_backend_t *select_backend_or_die(const char *requested)
 {
+    // GLES first: it is the mature, fastest-verified path on current hardware.
+    // Explicit GBTC_BACKEND=opencl still selects the OpenCL backend directly.
     const gbtc_backend_t *priority[] = {
-        &gbtc_vulkan_backend,
         &gbtc_gles_backend,
         &gbtc_opencl_backend,
+        &gbtc_vulkan_backend,
     };
     char rejection_summary[512] = "";
 
@@ -1397,9 +1400,9 @@ static const gbtc_backend_t *select_backend_or_die(const char *requested)
 static int print_probe_only(const char *requested)
 {
     const gbtc_backend_t *priority[] = {
-        &gbtc_vulkan_backend,
         &gbtc_gles_backend,
         &gbtc_opencl_backend,
+        &gbtc_vulkan_backend,
     };
     init_device_path_status();
     if (!gbtc_backend_is_auto(requested)) {
@@ -1469,6 +1472,9 @@ static uint32_t active_dispatch_quantum(const gbtc_backend_t *backend)
     if (backend && backend->kind == GBTC_BACKEND_GLES) {
         return gbtc_gles_batch_quantum(&gles_config);
     }
+    if (backend && backend->kind == GBTC_BACKEND_OPENCL) {
+        return gbtc_opencl_active_local_size();
+    }
     return 64u;
 }
 
@@ -1477,12 +1483,16 @@ static const char *active_gles_kernel_name(const gbtc_backend_t *backend)
     if (backend && backend->kind == GBTC_BACKEND_GLES) {
         return gbtc_gles_kernel_name(gles_config.kernel);
     }
+    if (backend && backend->kind == GBTC_BACKEND_OPENCL) {
+        return gbtc_opencl_kernel_name();
+    }
     return "";
 }
 
 static uint32_t active_gles_local_size(const gbtc_backend_t *backend)
 {
     if (backend && backend->kind == GBTC_BACKEND_GLES) return gles_config.local_size;
+    if (backend && backend->kind == GBTC_BACKEND_OPENCL) return gbtc_opencl_active_local_size();
     return 0;
 }
 
@@ -1674,6 +1684,13 @@ int main(void) {
         DIE("backend %s init failed: %s", backend->name, backend_reason);
     }
     LOG("selected backend=%s api=%s %s", backend->name, backend->api, backend_reason);
+    if (backend->kind == GBTC_BACKEND_OPENCL) {
+        const char *vendor = NULL, *name = NULL, *version = NULL;
+        gbtc_opencl_device_strings(&vendor, &name, &version);
+        snprintf(g_device_vendor, sizeof(g_device_vendor), "%s", vendor);
+        snprintf(g_device_name, sizeof(g_device_name), "%s", name);
+        snprintf(g_driver_name, sizeof(g_driver_name), "%s", version);
+    }
 
     if (bench_only) {
         return run_benchmark_and_exit(backend, backend_reason);
