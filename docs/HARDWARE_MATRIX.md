@@ -45,3 +45,12 @@ Current Iris Xe benchmark note:
   current example/Compose default for this Mesa path.
 - A 30-case short matrix compiled all five GLES kernel variants across local
   sizes 8, 16, 32, 64, 128, and 256.
+- 2026-09-21 (docker image with Mesa 26.1.2 backports, `RUSTICL_ENABLE=iris`,
+  persistent shader cache, mem 4g/cpus 4.0): `altbool/16/16M` measured
+  126.670 MH/s over 60.13 s; `unrolled/16/16M` 125.126 MH/s; autotune sweep
+  8..256 all within 122.3-124.6 MH/s (local size no longer significant).
+  Batch 33M measured 124.521 MH/s (larger batches do not help: both paths are
+  compute-saturated, sync overhead negligible). New `opencl` backend (Mesa
+  Rusticl, `ocl-unrolled`, local 64/128/256) measured ~120.5 MH/s sustained
+  and passes CPU-rechecked conformance on host Intel NEO too.
+  Winner and current default stays `gles/altbool/16/16M`.
