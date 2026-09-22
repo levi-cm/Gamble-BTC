@@ -7,6 +7,7 @@
 typedef struct {
     uint32_t local_size;
     int local_size_auto;
+    uint32_t poll_us;
 } gbtc_opencl_config_t;
 
 void gbtc_opencl_config_defaults(gbtc_opencl_config_t *cfg);

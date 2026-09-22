@@ -17,7 +17,7 @@ services:
     env_file:
       - .env
     environment:
-      GBTC_BACKEND: ${GBTC_BACKEND:-gles}
+      GBTC_BACKEND: ${GBTC_BACKEND:-opencl}
       GBTC_DEVICE: ${GBTC_DEVICE:-/dev/dri/renderD128}
       GBTC_GLES_KERNEL: ${GBTC_GLES_KERNEL:-altbool}
       GBTC_GLES_LOCAL_SIZE: ${GBTC_GLES_LOCAL_SIZE:-16}

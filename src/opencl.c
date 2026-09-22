@@ -6,6 +6,7 @@
 // unrolled SHA-256d nonce scan as the GLES path: work-item i tests
 // nonce_base + i and reports matches through a shared counter.
 
+#define _POSIX_C_SOURCE 200809L
 #include "opencl.h"
 #include "backend.h"
 
@@ -16,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // ---------------------------------------------------------------------------
 // Minimal OpenCL 1.2 declarations (no headers needed, dlopen only).
@@ -26,6 +28,7 @@ typedef uint64_t cl_ulong;
 typedef uint32_t cl_bool;
 typedef uint64_t cl_bitfield;
 typedef intptr_t cl_context_properties;
+typedef struct _cl_event *cl_event;
 typedef struct _cl_platform_id *cl_platform_id;
 typedef struct _cl_device_id *cl_device_id;
 typedef struct _cl_context *cl_context;
@@ -47,6 +50,11 @@ typedef size_t cl_device_type;
 #define CL_DEVICE_VERSION 0x102Fu
 #define CL_PROGRAM_BUILD_LOG 0x1183u
 #define CL_KERNEL_WORK_GROUP_SIZE 0x11B0u
+#define CL_EVENT_COMMAND_EXECUTION_STATUS 0x11D3u
+#define CL_COMPLETE 0
+#define CL_DEVICE_EXTENSIONS 0x1030u
+#define CL_QUEUE_PROPERTIES 0x1093u
+#define CL_QUEUE_THROTTLE_LOW_KHR ((cl_bitfield)(1 << 2))
 
 typedef struct {
     void *handle;
@@ -58,6 +66,8 @@ typedef struct {
                                 void (*)(const char *, const void *, size_t, void *),
                                 void *, cl_int *);
     cl_command_queue (*CreateCommandQueue)(cl_context, cl_device_id, cl_bitfield, cl_int *);
+    cl_command_queue (*CreateCommandQueueWithProperties)(cl_context, cl_device_id,
+                                                         const intptr_t *, cl_int *);
     cl_mem (*CreateBuffer)(cl_context, cl_bitfield, size_t, void *, cl_int *);
     cl_program (*CreateProgramWithSource)(cl_context, cl_uint, const char **, const size_t *, cl_int *);
     cl_int (*BuildProgram)(cl_program, cl_uint, const cl_device_id *, const char *,
@@ -72,6 +82,9 @@ typedef struct {
     cl_int (*EnqueueReadBuffer)(cl_command_queue, cl_mem, cl_bool, size_t, size_t,
                                 void *, cl_uint, const void *, void *);
     cl_int (*Finish)(cl_command_queue);
+    cl_int (*Flush)(cl_command_queue);
+    cl_int (*GetEventInfo)(cl_event, cl_uint, size_t, void *, size_t *);
+    cl_int (*ReleaseEvent)(cl_event);
     cl_int (*GetKernelWorkGroupInfo)(cl_kernel, cl_device_id, cl_uint, size_t, void *, size_t *);
     cl_int (*ReleaseKernel)(cl_kernel);
     cl_int (*ReleaseProgram)(cl_program);
@@ -119,6 +132,11 @@ static int cl_load(char *reason, size_t reason_cap)
     LOAD(GetDeviceInfo);
     LOAD(CreateContext);
     LOAD(CreateCommandQueue);
+    /* Optional: absent on old ICDs, guarded at use. */
+    {
+        void *sym_ = load_sym(handle, "clCreateCommandQueueWithProperties");
+        memcpy(&g_cl.CreateCommandQueueWithProperties, &sym_, sizeof(sym_));
+    }
     LOAD(CreateBuffer);
     LOAD(CreateProgramWithSource);
     LOAD(BuildProgram);
@@ -129,6 +147,15 @@ static int cl_load(char *reason, size_t reason_cap)
     LOAD(EnqueueNDRangeKernel);
     LOAD(EnqueueReadBuffer);
     LOAD(Finish);
+    /* Optional event-poll path (kills driver spin-wait); guarded at use. */
+    {
+        void *sym_ = load_sym(handle, "clFlush");
+        memcpy(&g_cl.Flush, &sym_, sizeof(sym_));
+        sym_ = load_sym(handle, "clGetEventInfo");
+        memcpy(&g_cl.GetEventInfo, &sym_, sizeof(sym_));
+        sym_ = load_sym(handle, "clReleaseEvent");
+        memcpy(&g_cl.ReleaseEvent, &sym_, sizeof(sym_));
+    }
     LOAD(GetKernelWorkGroupInfo);
     LOAD(ReleaseKernel);
     LOAD(ReleaseProgram);
@@ -145,12 +172,14 @@ static int cl_load(char *reason, size_t reason_cap)
 // Config.
 // ---------------------------------------------------------------------------
 #define GBTC_OPENCL_DEFAULT_LOCAL_SIZE 64u
+#define GBTC_OPENCL_DEFAULT_POLL_US 1000u
 #define GBTC_OPENCL_SOURCE_CAP (256u * 1024u)
 
 void gbtc_opencl_config_defaults(gbtc_opencl_config_t *cfg)
 {
     cfg->local_size = GBTC_OPENCL_DEFAULT_LOCAL_SIZE;
     cfg->local_size_auto = 0;
+    cfg->poll_us = GBTC_OPENCL_DEFAULT_POLL_US;
 }
 
 const char *gbtc_opencl_kernel_name(void)
@@ -173,23 +202,40 @@ int gbtc_opencl_config_from_env(gbtc_opencl_config_t *cfg, char *reason, size_t 
 {
     gbtc_opencl_config_defaults(cfg);
     const char *value = getenv("GBTC_OPENCL_LOCAL_SIZE");
-    if (!value || !value[0]) return 0;
-    if (strcmp(value, "auto") == 0) {
-        cfg->local_size_auto = 1;
-        return 0;
-    }
-    char *end = NULL;
-    errno = 0;
-    unsigned long parsed = strtoul(value, &end, 10);
-    if (errno || !end || *end != '\0' || parsed > UINT32_MAX ||
-        !opencl_local_size_allowed((uint32_t)parsed)) {
-        if (reason && reason_cap) {
-            snprintf(reason, reason_cap,
-                     "GBTC_OPENCL_LOCAL_SIZE must be auto, 8, 16, 32, 64, 128, 256, or 512");
+    if (value && value[0]) {
+        if (strcmp(value, "auto") == 0) {
+            cfg->local_size_auto = 1;
+        } else {
+            char *end = NULL;
+            errno = 0;
+            unsigned long parsed = strtoul(value, &end, 10);
+            if (errno || !end || *end != '\0' || parsed > UINT32_MAX ||
+                !opencl_local_size_allowed((uint32_t)parsed)) {
+                if (reason && reason_cap) {
+                    snprintf(reason, reason_cap,
+                             "GBTC_OPENCL_LOCAL_SIZE must be auto, 8, 16, 32, 64, 128, 256, or 512");
+                }
+                return -1;
+            }
+            cfg->local_size = (uint32_t)parsed;
         }
-        return -1;
     }
-    cfg->local_size = (uint32_t)parsed;
+    // Completion poll interval: the feeder thread sleeps this long between
+    // event-status checks instead of spin-waiting in the driver.
+    value = getenv("GBTC_OPENCL_POLL_US");
+    if (value && value[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long parsed = strtoul(value, &end, 10);
+        if (errno || !end || *end != '\0' || parsed < 100 || parsed > 50000) {
+            if (reason && reason_cap) {
+                snprintf(reason, reason_cap,
+                         "GBTC_OPENCL_POLL_US must be an integer from 100 to 50000 microseconds");
+            }
+            return -1;
+        }
+        cfg->poll_us = (uint32_t)parsed;
+    }
     return 0;
 }
 
@@ -359,6 +405,23 @@ static cl_kernel g_kernel = NULL;
 static cl_mem g_buf_in = NULL;
 static cl_mem g_buf_out = NULL;
 static char g_dev_info[512] = "";
+static const char *g_queue_mode = "default";
+static int g_ocl_debug = -1;
+
+static int ocl_debug_enabled(void)
+{
+    if (g_ocl_debug < 0) {
+        const char *v = getenv("GBTC_OPENCL_DEBUG");
+        g_ocl_debug = (v && v[0] != '0') ? 1 : 0;
+    }
+    return g_ocl_debug;
+}
+
+#define OCL_DBG(step, err)                                               \
+    do {                                                                 \
+        if (ocl_debug_enabled())                                         \
+            fprintf(stderr, "[opencl-debug] %s: err=%d\n", step, (int)(err)); \
+    } while (0)
 static char g_plat_name[256] = "";
 static char g_dev_name[256] = "";
 static char g_dev_ver[256] = "";
@@ -386,6 +449,51 @@ void gbtc_opencl_device_strings(const char **vendor, const char **name,
     if (version) *version = g_dev_ver[0] ? g_dev_ver : "unknown";
 }
 
+static int platform_is_fallback(const char *plat)
+{
+    // Mesa Rusticl / Clover stay available as fallbacks; a vendor driver
+    // (Intel NEO, ...) wins when present.
+    return plat && (strstr(plat, "rusticl") || strstr(plat, "Rusticl") ||
+                    strstr(plat, "Clover") || strstr(plat, "clover"));
+}
+
+static int try_pick_pass(cl_platform_id *platforms, cl_uint nplatforms, int skip_fallback)
+{
+    const char *want = getenv("GBTC_OPENCL_PLATFORM");
+    if (want && !want[0]) want = NULL;
+    for (cl_uint p = 0; p < nplatforms; p++) {
+        char plat[256] = "";
+        size_t n = 0;
+        g_cl.GetPlatformInfo(platforms[p], CL_PLATFORM_NAME, sizeof(plat), plat, &n);
+        if (want && !strstr(plat, want)) continue;
+        if (!want && skip_fallback && platform_is_fallback(plat)) continue;
+        cl_uint ndevs = 0;
+        if (g_cl.GetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, 0, NULL, &ndevs) != CL_SUCCESS ||
+            ndevs == 0) {
+            continue;
+        }
+        cl_device_id *devs = calloc(ndevs, sizeof(*devs));
+        if (!devs) return -2;
+        if (g_cl.GetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, ndevs, devs, NULL) != CL_SUCCESS) {
+            free(devs);
+            continue;
+        }
+        char dev[256] = "", ver[256] = "";
+        g_cl.GetDeviceInfo(devs[0], CL_DEVICE_NAME, sizeof(dev), dev, &n);
+        g_cl.GetDeviceInfo(devs[0], CL_DEVICE_VERSION, sizeof(ver), ver, &n);
+        snprintf(g_plat_name, sizeof(g_plat_name), "%s", plat[0] ? plat : "?");
+        snprintf(g_dev_name, sizeof(g_dev_name), "%s", dev[0] ? dev : "?");
+        snprintf(g_dev_ver, sizeof(g_dev_ver), "%s", ver[0] ? ver : "?");
+        snprintf(g_dev_info, sizeof(g_dev_info), "OpenCL %.160s / %.160s / %.160s",
+                 g_plat_name, g_dev_name, g_dev_ver);
+        g_platform = platforms[p];
+        g_device = devs[0];
+        free(devs);
+        return 0;
+    }
+    return -1;
+}
+
 static int pick_gpu_device(char *reason, size_t reason_cap)
 {
     cl_uint nplatforms = 0;
@@ -403,36 +511,17 @@ static int pick_gpu_device(char *reason, size_t reason_cap)
         set_reason(reason, reason_cap, "clGetPlatformIDs failed");
         goto out;
     }
-    for (cl_uint p = 0; p < nplatforms; p++) {
-        cl_uint ndevs = 0;
-        if (g_cl.GetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, 0, NULL, &ndevs) != CL_SUCCESS ||
-            ndevs == 0) {
-            continue;
-        }
-        cl_device_id *devs = calloc(ndevs, sizeof(*devs));
-        if (!devs) {
-            set_reason(reason, reason_cap, "out of memory");
-            goto out;
-        }
-        if (g_cl.GetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, ndevs, devs, NULL) != CL_SUCCESS) {
-            free(devs);
-            continue;
-        }
-        char plat[256] = "", dev[256] = "", ver[256] = "";
-        size_t n = 0;
-        g_cl.GetPlatformInfo(platforms[p], CL_PLATFORM_NAME, sizeof(plat), plat, &n);
-        g_cl.GetDeviceInfo(devs[0], CL_DEVICE_NAME, sizeof(dev), dev, &n);
-        g_cl.GetDeviceInfo(devs[0], CL_DEVICE_VERSION, sizeof(ver), ver, &n);
-        snprintf(g_plat_name, sizeof(g_plat_name), "%s", plat[0] ? plat : "?");
-        snprintf(g_dev_name, sizeof(g_dev_name), "%s", dev[0] ? dev : "?");
-        snprintf(g_dev_ver, sizeof(g_dev_ver), "%s", ver[0] ? ver : "?");
-        snprintf(g_dev_info, sizeof(g_dev_info), "OpenCL %s / %s / %s",
-                 g_plat_name, g_dev_name, g_dev_ver);
-        g_platform = platforms[p];
-        g_device = devs[0];
-        free(devs);
-        rc = 0;
-        break;
+    // Prefer a vendor driver (Intel NEO) over Mesa fallback ICDs.
+    rc = try_pick_pass(platforms, nplatforms, 1);
+    if (rc == -2) {
+        set_reason(reason, reason_cap, "out of memory");
+        goto out;
+    }
+    if (rc != 0) rc = try_pick_pass(platforms, nplatforms, 0);
+    if (rc == -2) {
+        set_reason(reason, reason_cap, "out of memory");
+        rc = -1;
+        goto out;
     }
     if (rc != 0) set_reason(reason, reason_cap, "no OpenCL GPU device found");
 out:
@@ -463,6 +552,7 @@ static void opencl_shutdown(void)
     if (g_buf_in) { g_cl.ReleaseMemObject(g_buf_in); g_buf_in = NULL; }
     if (g_buf_out) { g_cl.ReleaseMemObject(g_buf_out); g_buf_out = NULL; }
     if (g_queue) { g_cl.ReleaseCommandQueue(g_queue); g_queue = NULL; }
+    g_queue_mode = "default";
     if (g_ctx) { g_cl.ReleaseContext(g_ctx); g_ctx = NULL; }
     g_platform = NULL;
     g_device = NULL;
@@ -482,9 +572,42 @@ static int opencl_init(char *reason, size_t reason_cap)
         opencl_shutdown();
         return -1;
     }
-    g_queue = g_cl.CreateCommandQueue(g_ctx, g_device, 0, &err);
+    g_queue = NULL;
+    err = CL_SUCCESS;
+    // Power-effective waits: CL_QUEUE_THROTTLE_LOW_KHR makes the driver's
+    // completion wait sleep instead of spin-burning a CPU core. Without
+    // cl_khr_throttle_hints (or without the 2.0 entry point) fall back to a
+    // plain queue; the feeder thread then burns CPU in NEO's poll loop.
+    g_queue_mode = "default-no-entrypoint";
+    if (g_cl.CreateCommandQueueWithProperties) {
+        char exts[8192] = "";
+        size_t n = 0;
+        cl_int qerr = g_cl.GetDeviceInfo(g_device, CL_DEVICE_EXTENSIONS,
+                                         sizeof(exts) - 1, exts, &n);
+        if (qerr != CL_SUCCESS || n == 0) {
+            g_queue_mode = "default-extquery-failed";
+        } else if (!strstr(exts, "cl_khr_throttle_hints")) {
+            g_queue_mode = "default-no-throttle-ext";
+        } else {
+            const intptr_t props[] = {
+                (intptr_t)CL_QUEUE_PROPERTIES,
+                (intptr_t)CL_QUEUE_THROTTLE_LOW_KHR,
+                0
+            };
+            g_queue = g_cl.CreateCommandQueueWithProperties(g_ctx, g_device, props, &err);
+            if (!g_queue || err != CL_SUCCESS) {
+                g_queue_mode = "default-throttle-create-failed";
+                g_queue = NULL;
+            } else {
+                g_queue_mode = "throttle-low";
+            }
+        }
+    }
+    if (!g_queue) {
+        g_queue = g_cl.CreateCommandQueue(g_ctx, g_device, 0, &err);
+    }
     if (!g_queue || err != CL_SUCCESS) {
-        set_reason(reason, reason_cap, "clCreateCommandQueue failed (%d)", err);
+        set_reason(reason, reason_cap, "command queue creation failed (%d)", err);
         opencl_shutdown();
         return -1;
     }
@@ -557,9 +680,99 @@ static int opencl_init(char *reason, size_t reason_cap)
         opencl_shutdown();
         return -1;
     }
-    set_reason(reason, reason_cap, "OpenCL pipeline ready on %s (local_size=%u max_wg=%zu)",
-               g_dev_info, g_cfg.local_size, max_wg);
+    set_reason(reason, reason_cap, "OpenCL pipeline ready on %s (local_size=%u max_wg=%zu queue=%s)",
+               g_dev_info, g_cfg.local_size, max_wg, g_queue_mode);
     return 0;
+}
+
+static int opencl_run_batch_blocking(const gbtc_work_batch_t *work,
+                                       const cl_uint *in, cl_uint *out)
+{
+    // Fallback for ICDs without the event API: correct, but NEO's
+    // completion wait spin-burns a CPU core.
+    cl_uint zero = 0;
+    cl_int err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_in, CL_TRUE, 0, 16 * sizeof(cl_uint),
+                                         in, 0, NULL, NULL);
+    if (err != CL_SUCCESS) return -1;
+    err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_out, CL_TRUE, 0, sizeof(zero),
+                                  &zero, 0, NULL, NULL);
+    if (err != CL_SUCCESS) return -1;
+    size_t global = work->nonce_count;
+    size_t local = g_cfg.local_size;
+    err = g_cl.EnqueueNDRangeKernel(g_queue, g_kernel, 1, NULL, &global, &local,
+                                    0, NULL, NULL);
+    if (err != CL_SUCCESS) return -1;
+    if (g_cl.Finish(g_queue) != CL_SUCCESS) return -1;
+    err = g_cl.EnqueueReadBuffer(g_queue, g_buf_out, CL_TRUE, 0, 16 * sizeof(cl_uint),
+                                 out, 0, NULL, NULL);
+    return err == CL_SUCCESS ? 0 : -1;
+}
+
+static int event_is_complete(cl_event event)
+{
+    cl_int status = 0;
+    cl_int err = g_cl.GetEventInfo(event, CL_EVENT_COMMAND_EXECUTION_STATUS,
+                                   sizeof(status), &status, NULL);
+    OCL_DBG("get-event-info", err);
+    if (err != CL_SUCCESS) return -1;
+    if (status < 0) return -1;
+    return status == CL_COMPLETE;
+}
+
+static void sleep_us(uint32_t microseconds)
+{
+    struct timespec req;
+    req.tv_sec = (time_t)(microseconds / 1000000u);
+    req.tv_nsec = (long)((microseconds % 1000000u) * 1000u);
+    nanosleep(&req, NULL);
+}
+
+static int opencl_run_batch_polled(const gbtc_work_batch_t *work,
+                                   const cl_uint *in, cl_uint *out)
+{
+    // Preferred path: chain the whole batch behind events, flush once, then
+    // sleep-poll the kernel event. The feeder thread burns ~0 CPU while the
+    // iGPU works; the final blocking read returns immediately.
+    cl_event ev_w0 = NULL, ev_w1 = NULL, ev_k = NULL;
+    cl_int err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_in, CL_FALSE, 0, 16 * sizeof(cl_uint),
+                                         in, 0, NULL, &ev_w0);
+    OCL_DBG("write-in", err);
+    if (err != CL_SUCCESS || !ev_w0) goto fail;
+    cl_uint zero = 0;
+    err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_out, CL_FALSE, 0, sizeof(zero),
+                                  &zero, 1, &ev_w0, &ev_w1);
+    OCL_DBG("write-zero", err);
+    if (err != CL_SUCCESS || !ev_w1) goto fail;
+    size_t global = work->nonce_count;
+    size_t local = g_cfg.local_size;
+    err = g_cl.EnqueueNDRangeKernel(g_queue, g_kernel, 1, NULL, &global, &local,
+                                    1, &ev_w1, &ev_k);
+    OCL_DBG("ndrange", err);
+    if (err != CL_SUCCESS || !ev_k) goto fail;
+    err = g_cl.Flush(g_queue);
+    OCL_DBG("flush", err);
+    if (err != CL_SUCCESS) goto fail;
+
+    for (;;) {
+        int done = event_is_complete(ev_k);
+        if (done < 0) { OCL_DBG("event-info", -999); goto fail; }
+        if (done) break;
+        sleep_us(g_cfg.poll_us);
+    }
+
+    err = g_cl.EnqueueReadBuffer(g_queue, g_buf_out, CL_TRUE, 0, 16 * sizeof(cl_uint),
+                                 out, 0, NULL, NULL);
+    OCL_DBG("read", err);
+    g_cl.ReleaseEvent(ev_w0);
+    g_cl.ReleaseEvent(ev_w1);
+    g_cl.ReleaseEvent(ev_k);
+    return err == CL_SUCCESS ? 0 : -1;
+
+fail:
+    if (ev_w0) g_cl.ReleaseEvent(ev_w0);
+    if (ev_w1) g_cl.ReleaseEvent(ev_w1);
+    if (ev_k) g_cl.ReleaseEvent(ev_k);
+    return -1;
 }
 
 static int opencl_run_batch(const gbtc_work_batch_t *work, gbtc_backend_result_t *result)
@@ -572,30 +785,17 @@ static int opencl_run_batch(const gbtc_work_batch_t *work, gbtc_backend_result_t
     memcpy(in + 8, work->tail3, 3 * sizeof(cl_uint));
     in[11] = work->target[0];
     in[12] = work->nonce_base;
-    cl_uint zero = 0;
-    cl_int err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_in, CL_TRUE, 0, sizeof(in),
-                                         in, 0, NULL, NULL);
-    if (err != CL_SUCCESS) return -1;
-    err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_out, CL_TRUE, 0, sizeof(zero),
-                                  &zero, 0, NULL, NULL);
-    if (err != CL_SUCCESS) return -1;
 
-    err = g_cl.SetKernelArg(g_kernel, 0, sizeof(g_buf_in), &g_buf_in);
+    cl_int err = g_cl.SetKernelArg(g_kernel, 0, sizeof(g_buf_in), &g_buf_in);
     if (err != CL_SUCCESS) return -1;
     err = g_cl.SetKernelArg(g_kernel, 1, sizeof(g_buf_out), &g_buf_out);
     if (err != CL_SUCCESS) return -1;
 
-    size_t global = work->nonce_count;
-    size_t local = g_cfg.local_size;
-    err = g_cl.EnqueueNDRangeKernel(g_queue, g_kernel, 1, NULL, &global, &local,
-                                    0, NULL, NULL);
-    if (err != CL_SUCCESS) return -1;
-    if (g_cl.Finish(g_queue) != CL_SUCCESS) return -1;
-
+    int have_events = g_cl.Flush && g_cl.GetEventInfo && g_cl.ReleaseEvent;
     cl_uint out[16] = {0};
-    err = g_cl.EnqueueReadBuffer(g_queue, g_buf_out, CL_TRUE, 0, sizeof(out),
-                                 out, 0, NULL, NULL);
-    if (err != CL_SUCCESS) return -1;
+    int rc = have_events ? opencl_run_batch_polled(work, in, out)
+                         : opencl_run_batch_blocking(work, in, out);
+    if (rc != 0) return -1;
 
     result->count = out[0];
     if (result->count > GBTC_MAX_FOUND_NONCES) result->count = GBTC_MAX_FOUND_NONCES;

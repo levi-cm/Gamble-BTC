@@ -54,3 +54,15 @@ Current Iris Xe benchmark note:
   Rusticl, `ocl-unrolled`, local 64/128/256) measured ~120.5 MH/s sustained
   and passes CPU-rechecked conformance on host Intel NEO too.
   Winner and current default stays `gles/altbool/16/16M`.
+- 2026-09-21 part 2 (Intel NEO 26.35.39758.10 + IGC 2.41.5 fetched as pinned
+  upstream .debs; backend prefers NEO over Rusticl): `opencl/ocl-unrolled`
+  local 64 measured **182.978 MH/s**, local 128 178.801/183.078 MH/s over
+  60 s runs — the 160 MH/s target is exceeded and `opencl` is the new
+  default on this laptop.
+- NEO's completion wait spin-burns a CPU core (`clFinish` poll loop, upstream
+  issue intel/compute-runtime#363; `CL_QUEUE_THROTTLE_LOW_KHR` queue
+  creation is rejected by NEO 26.35). Fixed application-side: the backend
+  chains each batch behind events and sleep-polls (`nanosleep`,
+  `GBTC_OPENCL_POLL_US` default 1000) instead of blocking waits. Result:
+  **184.022 MH/s at 1.78% container CPU** (was ~100%). Event API absence
+  falls back to blocking waits; `GBTC_OPENCL_DEBUG=1` traces submission.

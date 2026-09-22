@@ -12,7 +12,7 @@ video_gid="${GBTC_VIDEO_GID:-983}"
 render_gid="${GBTC_RENDER_GID:-987}"
 # Tunables (same defaults as compose.yaml); override per run, e.g.
 # GBTC_BACKEND=opencl GBTC_OPENCL_LOCAL_SIZE=128 scripts/start-miner.sh
-backend="${GBTC_BACKEND:-gles}"
+backend="${GBTC_BACKEND:-opencl}"
 gles_kernel="${GBTC_GLES_KERNEL:-altbool}"
 gles_local="${GBTC_GLES_LOCAL_SIZE:-16}"
 opencl_local="${GBTC_OPENCL_LOCAL_SIZE:-64}"
@@ -28,11 +28,12 @@ usage() {
     cat <<'EOF'
 Usage: scripts/start-miner.sh [--dry-run|--probe|--detach]
 
-Starts the Gamble-BTC miner with the confirmed Iris Xe GLES settings:
-  GBTC_BACKEND=gles (override with GBTC_BACKEND=opencl for the OpenCL path)
+Starts the Gamble-BTC miner with the confirmed Iris Xe OpenCL settings:
+  GBTC_BACKEND=opencl (Intel NEO preferred, Rusticl fallback; use gles for
+  the GLES path)
+  GBTC_OPENCL_LOCAL_SIZE=64
   GBTC_GLES_KERNEL=altbool
   GBTC_GLES_LOCAL_SIZE=16
-  GBTC_OPENCL_LOCAL_SIZE=64
   GBTC_BATCH_NONCES=16777216
   MESA_NO_ERROR=1
 
