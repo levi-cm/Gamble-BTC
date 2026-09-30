@@ -96,3 +96,10 @@ Push toward 240 MH/s (2026-09-30) — why it is not reachable in software here:
   drops to 300-850 MHz and throughput collapses (52-138 MH/s, high variance).
   Meaningful benchmarks require a quiet machine; `scripts/bench-ab.sh`
   interleaves configs and reports medians to survive residual drift.
+- Host-level (explicitly approved, AC-only): `/etc/tlp.d/10-igpu-miner.conf`
+  pins `INTEL_GPU_MIN/MAX/BOOST_FREQ_ON_AC=1300` so sustained compute holds
+  max clocks; `_ON_BAT`/`_ON_SAV` restore the full 100-1300 range. Verified
+  both directions via `tlp bat`/`tlp ac`: min floor reads 100 on battery
+  profile, 1300 on AC. TLP auto-switches on physical plug/unplug, so the pin
+  can never leak into unplugged operation. (TLP validates min+max+boost as a
+  triple — all three must be set per profile or the write is skipped.)
