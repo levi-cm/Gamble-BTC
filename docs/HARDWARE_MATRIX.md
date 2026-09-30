@@ -66,3 +66,33 @@ Current Iris Xe benchmark note:
   `GBTC_OPENCL_POLL_US` default 1000) instead of blocking waits. Result:
   **184.022 MH/s at 1.78% container CPU** (was ~100%). Event API absence
   falls back to blocking waits; `GBTC_OPENCL_DEBUG=1` traces submission.
+
+Push toward 240 MH/s (2026-09-30) — why it is not reachable in software here:
+
+- ISA dump tooling added (`scripts/igc-dump.sh`, IGC `ShaderDumpEnable`). For
+  the default kernel IGC picks `simd_size=16`, `grf_count=128`, and
+  `eu_thread_count=7`, which is the maximum threads-per-EU on TGLLP. Occupancy
+  is therefore already saturated; it was the leading hypothesis and it is
+  disproven.
+- Forcing `GBTC_OPENCL_SIMD=32` selects `simd_size=32` while keeping
+  `eu_thread_count=7`, but the instruction count doubles (4029 -> 8056) and
+  spills appear, i.e. IGC splits the wide work-item back down. Measured
+  throughput is unchanged (interleaved A/B medians 98.5 auto / 101.7 simd16 /
+  99.3 simd32).
+- Kernel variants added (`GBTC_OPENCL_KERNEL=unrolled|looped|dual`), all
+  CPU-recheck conformance-tested on NEO and Rusticl. `looped` is much slower
+  (IGC does not unroll it well) and `dual` (two nonces per item) is also
+  slower, so `unrolled` stays the default.
+- Opcode census of the GenISA: 1056 `rol`, 1105 `add`, 1055 `xor`, 487 `and`,
+  122 `or`, and **zero `lop3`**. Rewriting CH/MAJ into the classic
+  LOP3-friendly forms did not make IGC fuse them (4045 vs 4029 instructions),
+  so the multi-instruction CH/MAJ cost is compiler-bound, not source-bound.
+- Conclusion: the OpenCL kernel is at its practical ceiling for IGC on this
+  part. The 184 MH/s figure stands. Reaching 240 MH/s would need a
+  structurally different approach (hand-written GenISA / Xe-assembly kernel)
+  or more GPU power headroom, not more compiler flags.
+- Environment caveat: this laptop shares a 35 W package budget
+  (`throttle_reason_pl1=1`, `thermal=0`). Under concurrent CPU load the iGPU
+  drops to 300-850 MHz and throughput collapses (52-138 MH/s, high variance).
+  Meaningful benchmarks require a quiet machine; `scripts/bench-ab.sh`
+  interleaves configs and reports medians to survive residual drift.

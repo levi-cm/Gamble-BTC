@@ -4,10 +4,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
+typedef enum {
+    GBTC_OCL_KERNEL_UNROLLED = 0,
+    GBTC_OCL_KERNEL_LOOPED,
+    GBTC_OCL_KERNEL_DUAL,
+} gbtc_ocl_kernel_t;
+
 typedef struct {
     uint32_t local_size;
     int local_size_auto;
     uint32_t poll_us;
+    // Requested SIMD/subgroup width; 0 means let IGC choose.
+    uint32_t simd;
+    gbtc_ocl_kernel_t kernel;
 } gbtc_opencl_config_t;
 
 void gbtc_opencl_config_defaults(gbtc_opencl_config_t *cfg);

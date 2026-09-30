@@ -175,27 +175,51 @@ static int cl_load(char *reason, size_t reason_cap)
 #define GBTC_OPENCL_DEFAULT_POLL_US 1000u
 #define GBTC_OPENCL_SOURCE_CAP (256u * 1024u)
 
+static gbtc_opencl_config_t g_cfg;
+
 void gbtc_opencl_config_defaults(gbtc_opencl_config_t *cfg)
 {
     cfg->local_size = GBTC_OPENCL_DEFAULT_LOCAL_SIZE;
     cfg->local_size_auto = 0;
     cfg->poll_us = GBTC_OPENCL_DEFAULT_POLL_US;
+    cfg->simd = 0;
+    cfg->kernel = GBTC_OCL_KERNEL_UNROLLED;
 }
 
 const char *gbtc_opencl_kernel_name(void)
 {
-    return "ocl-unrolled";
+    switch (g_cfg.kernel) {
+    case GBTC_OCL_KERNEL_LOOPED: return "ocl-looped";
+    case GBTC_OCL_KERNEL_DUAL: return "ocl-dual";
+    case GBTC_OCL_KERNEL_UNROLLED:
+    default: return "ocl-unrolled";
+    }
 }
 
 uint32_t gbtc_opencl_batch_quantum(const gbtc_opencl_config_t *cfg)
 {
-    return cfg->local_size;
+    uint32_t q = cfg->local_size;
+    if (cfg->kernel == GBTC_OCL_KERNEL_DUAL) q *= 2u;
+    return q;
 }
 
 static int opencl_local_size_allowed(uint32_t v)
 {
     return v == 8 || v == 16 || v == 32 || v == 64 ||
            v == 128 || v == 256 || v == 512;
+}
+
+static int opencl_simd_allowed(uint32_t v)
+{
+    return v == 0 || v == 8 || v == 16 || v == 32;
+}
+
+static int opencl_parse_kernel(const char *value, gbtc_ocl_kernel_t *out)
+{
+    if (strcmp(value, "unrolled") == 0) { *out = GBTC_OCL_KERNEL_UNROLLED; return 0; }
+    if (strcmp(value, "looped") == 0) { *out = GBTC_OCL_KERNEL_LOOPED; return 0; }
+    if (strcmp(value, "dual") == 0) { *out = GBTC_OCL_KERNEL_DUAL; return 0; }
+    return -1;
 }
 
 int gbtc_opencl_config_from_env(gbtc_opencl_config_t *cfg, char *reason, size_t reason_cap)
@@ -235,6 +259,36 @@ int gbtc_opencl_config_from_env(gbtc_opencl_config_t *cfg, char *reason, size_t 
             return -1;
         }
         cfg->poll_us = (uint32_t)parsed;
+    }
+    // SIMD/subgroup width request; emitted as intel_reqd_sub_group_size.
+    value = getenv("GBTC_OPENCL_SIMD");
+    if (value && value[0]) {
+        if (strcmp(value, "auto") == 0) {
+            cfg->simd = 0;
+        } else {
+            char *end = NULL;
+            errno = 0;
+            unsigned long parsed = strtoul(value, &end, 10);
+            if (errno || !end || *end != '\0' || parsed > UINT32_MAX ||
+                !opencl_simd_allowed((uint32_t)parsed)) {
+                if (reason && reason_cap) {
+                    snprintf(reason, reason_cap,
+                             "GBTC_OPENCL_SIMD must be auto, 8, 16, or 32");
+                }
+                return -1;
+            }
+            cfg->simd = (uint32_t)parsed;
+        }
+    }
+    value = getenv("GBTC_OPENCL_KERNEL");
+    if (value && value[0]) {
+        if (opencl_parse_kernel(value, &cfg->kernel) != 0) {
+            if (reason && reason_cap) {
+                snprintf(reason, reason_cap,
+                         "GBTC_OPENCL_KERNEL must be unrolled, looped, or dual");
+            }
+            return -1;
+        }
     }
     return 0;
 }
@@ -281,6 +335,141 @@ static const uint32_t SHA_K[64] = {
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
 };
 
+// Emit the 64-round compression for one block using rotating variable names.
+// After 64 rounds (a multiple of 8) the working variables are back in their
+// original name order and hold the resulting digest words.
+static void emit_unrolled_block(sb_t *sb, const char *const vnames[8],
+                                const char *const wnames[16])
+{
+    const char *v[8];
+    for (int i = 0; i < 8; i++) v[i] = vnames[i];
+
+    for (int t = 0; t < 64; t++) {
+        const char *wt = wnames[t & 15];
+        if (t >= 16) {
+            int s = t & 15, s2 = (t - 2) & 15, s7 = (t - 7) & 15, s15 = (t - 15) & 15;
+            sb_appendf(sb, "  %s = %s + SMALLSIG0(%s) + %s + SMALLSIG1(%s);\n",
+                       wnames[s], wnames[s], wnames[s15], wnames[s7], wnames[s2]);
+            wt = wnames[s];
+        }
+        sb_appendf(sb,
+            "  t1 = %s + BIGSIG1(%s) + CH(%s,%s,%s) + 0x%08xu + %s;\n"
+            "  t2 = BIGSIG0(%s) + MAJ(%s,%s,%s);\n"
+            "  %s = %s + t1; %s = t1 + t2;\n",
+            v[7], v[4], v[4], v[5], v[6], SHA_K[t], wt,
+            v[0], v[0], v[1], v[2],
+            v[3], v[3], v[7]);
+        const char *na = v[7], *ne = v[3];
+        v[7] = v[6]; v[6] = v[5]; v[5] = v[4]; v[4] = ne;
+        v[3] = v[2]; v[2] = v[1]; v[1] = v[0]; v[0] = na;
+    }
+}
+
+// Emit one complete SHA-256d nonce test (two compression rounds) with names
+// suffixed so several nonces can share a kernel body. Caller declares
+// `t1`/`t2` scratch and passes an expression evaluating to the nonce, which is
+// also what gets recorded on a match.
+static void emit_nonce_unrolled(sb_t *sb, const char *nonce_expr, const char *sfx)
+{
+    char vn[8][12], wn[16][12];
+    const char *vnames[8], *wnames[16];
+    for (int i = 0; i < 8; i++) {
+        snprintf(vn[i], sizeof(vn[i]), "%c%s", "abcdefgh"[i], sfx);
+        vnames[i] = vn[i];
+    }
+    for (int i = 0; i < 16; i++) {
+        snprintf(wn[i], sizeof(wn[i]), "w%d%s", i, sfx);
+        wnames[i] = wn[i];
+    }
+
+    sb_appendf(sb, "  uint %s = I[8], %s = I[9], %s = I[10], %s = %s;\n",
+               wnames[0], wnames[1], wnames[2], wnames[3], nonce_expr);
+    sb_appendf(sb, "  uint %s = 0x80000000u", wnames[4]);
+    for (int i = 5; i < 15; i++) sb_appendf(sb, ", %s = 0u", wnames[i]);
+    sb_appendf(sb, ", %s = 640u;\n", wnames[15]);
+    sb_appendf(sb, "  uint %s = I[0], %s = I[1], %s = I[2], %s = I[3];\n",
+               vnames[0], vnames[1], vnames[2], vnames[3]);
+    sb_appendf(sb, "  uint %s = I[4], %s = I[5], %s = I[6], %s = I[7];\n",
+               vnames[4], vnames[5], vnames[6], vnames[7]);
+
+    emit_unrolled_block(sb, vnames, wnames);
+
+    // Fold the midstate into the digest, then run the second block.
+    for (int i = 0; i < 8; i++) {
+        sb_appendf(sb, "  %s = I[%d] + %s;\n", wnames[i], i, vnames[i]);
+    }
+    sb_appendf(sb, "  %s = 0x80000000u", wnames[8]);
+    for (int i = 9; i < 15; i++) sb_appendf(sb, ", %s = 0u", wnames[i]);
+    sb_appendf(sb, ", %s = 256u;\n", wnames[15]);
+    sb_appendf(sb, "  %s = 0x6a09e667u; %s = 0xbb67ae85u;"
+                   " %s = 0x3c6ef372u; %s = 0xa54ff53au;\n",
+               vnames[0], vnames[1], vnames[2], vnames[3]);
+    sb_appendf(sb, "  %s = 0x510e527fu; %s = 0x9b05688cu;"
+                   " %s = 0x1f83d9abu; %s = 0x5be0cd19u;\n",
+               vnames[4], vnames[5], vnames[6], vnames[7]);
+
+    emit_unrolled_block(sb, vnames, wnames);
+
+    sb_appendf(sb,
+        "  if (BSWAP32(0x5be0cd19u + %s) <= I[11]) {\n"
+        "    uint idx%s = atomic_inc(O);\n"
+        "    if (idx%s < 15u) O[idx%s + 1u] = %s;\n"
+        "  }\n",
+        vnames[7], sfx, sfx, sfx, nonce_expr);
+}
+
+// Compact round-loop variant: far less generated code and fewer live values
+// are visible to the compiler than the fully unrolled form.
+static void emit_nonce_looped(sb_t *sb, const char *nonce_expr)
+{
+    sb_appendf(sb,
+        "  uint w[16];\n"
+        "  uint a, b, c, d, e, f, g, h;\n"
+        "  const uint K[64] = {");
+    for (int i = 0; i < 64; i++) {
+        sb_appendf(sb, "%s0x%08xu", i ? ", " : "", SHA_K[i]);
+    }
+    sb_appendf(sb,
+        "};\n"
+        "  w[0] = I[8]; w[1] = I[9]; w[2] = I[10]; w[3] = %s;\n"
+        "  w[4] = 0x80000000u; w[5] = 0u; w[6] = 0u; w[7] = 0u;\n"
+        "  w[8] = 0u; w[9] = 0u; w[10] = 0u; w[11] = 0u;\n"
+        "  w[12] = 0u; w[13] = 0u; w[14] = 0u; w[15] = 640u;\n"
+        "  a = I[0]; b = I[1]; c = I[2]; d = I[3];\n"
+        "  e = I[4]; f = I[5]; g = I[6]; h = I[7];\n",
+        nonce_expr);
+    for (int block = 0; block < 2; block++) {
+        if (block == 1) {
+            sb_appendf(sb,
+                "  w[0] = I[0] + a; w[1] = I[1] + b; w[2] = I[2] + c; w[3] = I[3] + d;\n"
+                "  w[4] = I[4] + e; w[5] = I[5] + f; w[6] = I[6] + g; w[7] = I[7] + h;\n"
+                "  w[8] = 0x80000000u; w[9] = 0u; w[10] = 0u; w[11] = 0u;\n"
+                "  w[12] = 0u; w[13] = 0u; w[14] = 0u; w[15] = 256u;\n"
+                "  a = 0x6a09e667u; b = 0xbb67ae85u; c = 0x3c6ef372u; d = 0xa54ff53au;\n"
+                "  e = 0x510e527fu; f = 0x9b05688cu; g = 0x1f83d9abu; h = 0x5be0cd19u;\n");
+        }
+        sb_appendf(sb,
+            "  for (int i = 0; i < 64; i++) {\n"
+            "    uint wt = w[i & 15];\n"
+            "    if (i >= 16) {\n"
+            "      w[i & 15] = wt + SMALLSIG0(w[(i - 15) & 15]) + w[(i - 7) & 15]\n"
+            "                + SMALLSIG1(w[(i - 2) & 15]);\n"
+            "      wt = w[i & 15];\n"
+            "    }\n"
+            "    uint lt1 = h + BIGSIG1(e) + CH(e, f, g) + K[i] + wt;\n"
+            "    uint lt2 = BIGSIG0(a) + MAJ(a, b, c);\n"
+            "    h = g; g = f; f = e; e = d + lt1;\n"
+            "    d = c; c = b; b = a; a = lt1 + lt2;\n"
+            "  }\n");
+    }
+    sb_appendf(sb,
+        "  if (BSWAP32(0x5be0cd19u + h) <= I[11]) {\n"
+        "    uint idx = atomic_inc(O);\n"
+        "    if (idx < 15u) O[idx + 1u] = %s;\n"
+        "  }\n",
+        nonce_expr);
+}
+
 char *gbtc_opencl_build_kernel_src(char *reason, size_t reason_cap)
 {
     char *buf = calloc(1, GBTC_OPENCL_SOURCE_CAP);
@@ -298,91 +487,33 @@ char *gbtc_opencl_build_kernel_src(char *reason, size_t reason_cap)
         "#define SMALLSIG1(x) (ROR(x,17u)^ROR(x,19u)^((x)>>10u))\n"
         "#define CH(x,y,z) (((x)&(y))^(~(x)&(z)))\n"
         "#define MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))\n"
-        "#define BSWAP32(x) (((x)>>24u)|(((x)>>8u)&0x0000ff00u)|(((x)<<8u)&0x00ff0000u)|((x)<<24u))\n"
+        "#define BSWAP32(x) (((x)>>24u)|(((x)>>8u)&0x0000ff00u)|(((x)<<8u)&0x00ff0000u)|((x)<<24u))\n");
+
+    if (g_cfg.simd != 0) {
+        sb_appendf(&sb, "#define GBTC_SIMD_ATTR "
+                         "__attribute__((intel_reqd_sub_group_size(%u)))\n", g_cfg.simd);
+    } else {
+        sb_appendf(&sb, "#define GBTC_SIMD_ATTR\n");
+    }
+
+    sb_appendf(&sb,
+        "GBTC_SIMD_ATTR\n"
         "__kernel void gbtc_mine(__global const uint *I, __global uint *O) {\n"
         "  uint gid = get_global_id(0);\n"
-        "  uint nonce = I[12] + gid;\n"
         "  uint t1, t2;\n"
-        "  uint w0 = I[8];\n"
-        "  uint w1 = I[9];\n"
-        "  uint w2 = I[10];\n"
-        "  uint w3 = nonce;\n"
-        "  uint w4 = 0x80000000u;\n"
-        "  uint w5 = 0u; uint w6 = 0u; uint w7 = 0u; uint w8 = 0u;\n"
-        "  uint w9 = 0u; uint w10 = 0u; uint w11 = 0u; uint w12 = 0u;\n"
-        "  uint w13 = 0u; uint w14 = 0u; uint w15 = 640u;\n"
-        "  uint a = I[0]; uint b = I[1]; uint c = I[2]; uint d = I[3];\n"
-        "  uint e = I[4]; uint f = I[5]; uint g = I[6]; uint h = I[7];\n");
+        "  (void)t1; (void)t2;\n");
 
-    const char *wnames[16] = {
-        "w0","w1","w2","w3","w4","w5","w6","w7",
-        "w8","w9","w10","w11","w12","w13","w14","w15"
-    };
-    for (int half = 0; half < 2; half++) {
-        const char *v[8] = {"a","b","c","d","e","f","g","h"};
-        if (half == 1) {
-            sb_appendf(&sb,
-                "  uint h1_0 = I[0] + %s;\n"
-                "  uint h1_1 = I[1] + %s;\n"
-                "  uint h1_2 = I[2] + %s;\n"
-                "  uint h1_3 = I[3] + %s;\n"
-                "  uint h1_4 = I[4] + %s;\n"
-                "  uint h1_5 = I[5] + %s;\n"
-                "  uint h1_6 = I[6] + %s;\n"
-                "  uint h1_7 = I[7] + %s;\n"
-                "  w0 = h1_0; w1 = h1_1; w2 = h1_2; w3 = h1_3;\n"
-                "  w4 = h1_4; w5 = h1_5; w6 = h1_6; w7 = h1_7;\n"
-                "  w8 = 0x80000000u; w9 = 0u; w10 = 0u; w11 = 0u;\n"
-                "  w12 = 0u; w13 = 0u; w14 = 0u; w15 = 256u;\n"
-                "  a = 0x6a09e667u; b = 0xbb67ae85u; c = 0x3c6ef372u; d = 0xa54ff53au;\n"
-                "  e = 0x510e527fu; f = 0x9b05688cu; g = 0x1f83d9abu; h = 0x5be0cd19u;\n",
-                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
-            // After the midstate add, the working variables hold the first-half
-            // digest words; reset the rotation tracker for the second half.
-            v[0]="a"; v[1]="b"; v[2]="c"; v[3]="d";
-            v[4]="e"; v[5]="f"; v[6]="g"; v[7]="h";
-        }
-        for (int t = 0; t < 64; t++) {
-            const char *wt;
-            if (t < 16) {
-                wt = wnames[t];
-            } else {
-                int s = t & 15;
-                int s2 = (t - 2) & 15;
-                int s7 = (t - 7) & 15;
-                int s15 = (t - 15) & 15;
-                sb_appendf(&sb, "  %s = %s + SMALLSIG0(%s) + %s + SMALLSIG1(%s);\n",
-                           wnames[s], wnames[s], wnames[s15], wnames[s7], wnames[s2]);
-                wt = wnames[s];
-            }
-            sb_appendf(&sb,
-                "  t1 = %s + BIGSIG1(%s) + CH(%s,%s,%s) + 0x%08xu + %s;\n"
-                "  t2 = BIGSIG0(%s) + MAJ(%s,%s,%s);\n"
-                "  %s = %s + t1; %s = t1 + t2;\n",
-                v[7], v[4], v[4], v[5], v[6], SHA_K[t], wt,
-                v[0], v[0], v[1], v[2],
-                v[3], v[3], v[7]);
-            const char *na = v[7], *ne = v[3];
-            v[7] = v[6]; v[6] = v[5]; v[5] = v[4]; v[4] = ne;
-            v[3] = v[2]; v[2] = v[1]; v[1] = v[0]; v[0] = na;
-        }
-        if (half == 0) {
-            // Stash first-half digest words in w0..w7 for the midstate add above.
-            sb_appendf(&sb,
-                "  w0 = I[0] + %s; w1 = I[1] + %s; w2 = I[2] + %s; w3 = I[3] + %s;\n"
-                "  w4 = I[4] + %s; w5 = I[5] + %s; w6 = I[6] + %s; w7 = I[7] + %s;\n",
-                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
-        } else {
-            sb_appendf(&sb,
-                "  uint final_h7 = 0x5be0cd19u + %s;\n"
-                "  if (BSWAP32(final_h7) <= I[11]) {\n"
-                "    uint idx = atomic_inc(O);\n"
-                "    if (idx < 15u) O[idx + 1u] = nonce;\n"
-                "  }\n"
-                "}\n",
-                v[7]);
-        }
+    if (g_cfg.kernel == GBTC_OCL_KERNEL_DUAL) {
+        // Two adjacent nonces per work-item: halves the global size and
+        // amortizes per-item setup, at the cost of register pressure.
+        emit_nonce_unrolled(&sb, "I[12] + (gid << 1u)", "0");
+        emit_nonce_unrolled(&sb, "I[12] + (gid << 1u) + 1u", "1");
+    } else if (g_cfg.kernel == GBTC_OCL_KERNEL_LOOPED) {
+        emit_nonce_looped(&sb, "I[12] + gid");
+    } else {
+        emit_nonce_unrolled(&sb, "I[12] + gid", "");
     }
+    sb_appendf(&sb, "}\n");
 
     if (sb.failed) {
         free(buf);
@@ -395,7 +526,6 @@ char *gbtc_opencl_build_kernel_src(char *reason, size_t reason_cap)
 // ---------------------------------------------------------------------------
 // Backend state.
 // ---------------------------------------------------------------------------
-static gbtc_opencl_config_t g_cfg;
 static cl_platform_id g_platform = NULL;
 static cl_device_id g_device = NULL;
 static cl_context g_ctx = NULL;
@@ -685,6 +815,13 @@ static int opencl_init(char *reason, size_t reason_cap)
     return 0;
 }
 
+static size_t opencl_global_size(const gbtc_work_batch_t *work)
+{
+    return g_cfg.kernel == GBTC_OCL_KERNEL_DUAL
+               ? (size_t)(work->nonce_count / 2u)
+               : (size_t)work->nonce_count;
+}
+
 static int opencl_run_batch_blocking(const gbtc_work_batch_t *work,
                                        const cl_uint *in, cl_uint *out)
 {
@@ -697,7 +834,7 @@ static int opencl_run_batch_blocking(const gbtc_work_batch_t *work,
     err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_out, CL_TRUE, 0, sizeof(zero),
                                   &zero, 0, NULL, NULL);
     if (err != CL_SUCCESS) return -1;
-    size_t global = work->nonce_count;
+    size_t global = opencl_global_size(work);
     size_t local = g_cfg.local_size;
     err = g_cl.EnqueueNDRangeKernel(g_queue, g_kernel, 1, NULL, &global, &local,
                                     0, NULL, NULL);
@@ -743,7 +880,7 @@ static int opencl_run_batch_polled(const gbtc_work_batch_t *work,
                                   &zero, 1, &ev_w0, &ev_w1);
     OCL_DBG("write-zero", err);
     if (err != CL_SUCCESS || !ev_w1) goto fail;
-    size_t global = work->nonce_count;
+    size_t global = opencl_global_size(work);
     size_t local = g_cfg.local_size;
     err = g_cl.EnqueueNDRangeKernel(g_queue, g_kernel, 1, NULL, &global, &local,
                                     1, &ev_w1, &ev_k);
@@ -778,7 +915,7 @@ fail:
 static int opencl_run_batch(const gbtc_work_batch_t *work, gbtc_backend_result_t *result)
 {
     if (!work || !result || !g_kernel || work->nonce_count == 0) return -1;
-    if ((work->nonce_count % g_cfg.local_size) != 0) return -1;
+    if ((work->nonce_count % gbtc_opencl_batch_quantum(&g_cfg)) != 0) return -1;
 
     cl_uint in[16] = {0};
     memcpy(in + 0, work->midstate, 8 * sizeof(cl_uint));

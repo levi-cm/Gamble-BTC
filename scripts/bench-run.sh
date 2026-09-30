@@ -15,6 +15,10 @@ log="bench-results/run-${ts}.log"
 : "${GBTC_GLES_KERNEL:=altbool}"
 : "${GBTC_GLES_LOCAL_SIZE:=16}"
 : "${GBTC_OPENCL_LOCAL_SIZE:=64}"
+: "${GBTC_OPENCL_SIMD:=auto}"
+: "${GBTC_OPENCL_KERNEL:=unrolled}"
+# IGC knob (diagnostic): force a SIMD width the compiler would not pick itself.
+: "${GBTC_IGC_FORCE_SIMD:=}"
 : "${GBTC_BENCH_SECONDS:=60}"
 : "${GBTC_BENCH_WARMUP_SECONDS:=5}"
 : "${GBTC_BATCH_NONCES:=16777216}"
@@ -26,6 +30,11 @@ log="bench-results/run-${ts}.log"
 
 mkdir -p "$GBTC_SHADER_CACHE"
 
+extra_env=()
+if [[ -n "$GBTC_IGC_FORCE_SIMD" ]]; then
+  extra_env+=(-e "IGC_ForceOCLSIMDWidth=${GBTC_IGC_FORCE_SIMD}")
+fi
+
 docker run --rm --network host \
   -e GBTC_BENCH_ONLY=1 \
   -e GBTC_BACKEND="${GBTC_BACKEND}" \
@@ -33,6 +42,9 @@ docker run --rm --network host \
   -e GBTC_GLES_KERNEL="${GBTC_GLES_KERNEL}" \
   -e GBTC_GLES_LOCAL_SIZE="${GBTC_GLES_LOCAL_SIZE}" \
   -e GBTC_OPENCL_LOCAL_SIZE="${GBTC_OPENCL_LOCAL_SIZE}" \
+  -e GBTC_OPENCL_SIMD="${GBTC_OPENCL_SIMD}" \
+  -e GBTC_OPENCL_KERNEL="${GBTC_OPENCL_KERNEL}" \
+  "${extra_env[@]}" \
   -e GBTC_BENCH_SECONDS="${GBTC_BENCH_SECONDS}" \
   -e GBTC_BENCH_WARMUP_SECONDS="${GBTC_BENCH_WARMUP_SECONDS}" \
   -e GBTC_BATCH_NONCES="${GBTC_BATCH_NONCES}" \
