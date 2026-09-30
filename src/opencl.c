@@ -495,9 +495,20 @@ char *gbtc_opencl_build_kernel_src(char *reason, size_t reason_cap)
     } else {
         sb_appendf(&sb, "#define GBTC_SIMD_ATTR\n");
     }
+    // Telling IGC the exact work-group size lets it specialize dispatch and
+    // register allocation. Only possible when the size is explicit, not auto
+    // (auto is resolved after the program is built).
+    if (!g_cfg.local_size_auto) {
+        sb_appendf(&sb, "#define GBTC_WG_ATTR "
+                         "__attribute__((reqd_work_group_size(%u, 1, 1)))\n",
+                   g_cfg.local_size);
+    } else {
+        sb_appendf(&sb, "#define GBTC_WG_ATTR\n");
+    }
 
     sb_appendf(&sb,
         "GBTC_SIMD_ATTR\n"
+        "GBTC_WG_ATTR\n"
         "__kernel void gbtc_mine(__global const uint *I, __global uint *O) {\n"
         "  uint gid = get_global_id(0);\n"
         "  uint t1, t2;\n"
