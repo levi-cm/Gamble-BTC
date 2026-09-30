@@ -67,7 +67,7 @@ Current Iris Xe benchmark note:
   **184.022 MH/s at 1.78% container CPU** (was ~100%). Event API absence
   falls back to blocking waits; `GBTC_OPENCL_DEBUG=1` traces submission.
 
-Push toward 240 MH/s (2026-09-30) — why it is not reachable in software here:
+Prior push toward 240 MH/s (2026-09-30) — tested tuning paths:
 
 - ISA dump tooling added (`scripts/igc-dump.sh`, IGC `ShaderDumpEnable`). For
   the default kernel IGC picks `simd_size=16`, `grf_count=128`, and
@@ -87,10 +87,11 @@ Push toward 240 MH/s (2026-09-30) — why it is not reachable in software here:
   122 `or`, and **zero `lop3`**. Rewriting CH/MAJ into the classic
   LOP3-friendly forms did not make IGC fuse them (4045 vs 4029 instructions),
   so the multi-instruction CH/MAJ cost is compiler-bound, not source-bound.
-- Conclusion: the OpenCL kernel is at its practical ceiling for IGC on this
-  part. The 184 MH/s figure stands. Reaching 240 MH/s would need a
-  structurally different approach (hand-written GenISA / Xe-assembly kernel)
-  or more GPU power headroom, not more compiler flags.
+- At the time, 184.022 MH/s was the best sustained low-CPU result. The tested
+  OpenCL variants and dispatch options did not approach 240 MH/s, but these
+  measurements are not a mathematical upper-bound proof. A hand-written
+  GenISA/Xe-assembly kernel is an unmeasured research direction, not a
+  guaranteed gain.
 - Environment caveat: this laptop shares a 35 W package budget
   (`throttle_reason_pl1=1`, `thermal=0`). Under concurrent CPU load the iGPU
   drops to 300-850 MHz and throughput collapses (52-138 MH/s, high variance).
@@ -103,3 +104,47 @@ Push toward 240 MH/s (2026-09-30) — why it is not reachable in software here:
   profile, 1300 on AC. TLP auto-switches on physical plug/unplug, so the pin
   can never leak into unplugged operation. (TLP validates min+max+boost as a
   triple — all three must be set per profile or the write is skipped.)
+
+Follow-up audit toward 200 MH/s (2026-09-30):
+
+- The explicit-64 versus auto-64 interleaved run (`scripts/bench-ab.sh 4 60`)
+  produced the following mid-run samples. Only round 1's explicit-64 sample
+  was full-clock; the other seven samples had PL1 active and are not valid for
+  comparing full-clock throughput.
+
+  | Round | Explicit 64 MH/s | GT MHz | PL1 | Auto 64 MH/s | GT MHz | PL1 |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 193.994 | 1300 | 0 | 160.175 | 1050 | 1 |
+  | 2 | 163.278 | 1050 | 1 | 158.001 | 1050 | 1 |
+  | 3 | 164.508 | 1150 | 1 | 162.993 | 1200 | 1 |
+  | 4 | 165.939 | 1050 | 1 | 163.502 | 1100 | 1 |
+
+  The script's all-round medians (165.223 and 161.584 MH/s) are throttled and
+  must not be used as full-clock A/B results.
+- Separate 60-second spot runs with PL1 clear measured explicit-64 at
+  **189.796 MH/s** (1300 MHz, PL1=0) and auto-64 at **186.634 MH/s**
+  (1300 MHz, PL1=0). Together with the valid interleaved sample, the observed
+  full-clock range is 186.634-193.994 MH/s. These isolated samples do not form
+  a repeatable interleaved A/B median.
+- ISA comparison: the explicit required work-group size allows the global-ID
+  scale operation to compile as `shl 6` instead of `mul`; instruction count
+  remains unchanged (4020 `.isaasm` instruction lines by mnemonic count; IGC
+  `.instCount` 4044 in both dumps), as do SIMD16, 128 GRFs, and 7 threads/EU.
+  This is not evidence for the 7-9% throughput increase required to reach 200
+  MH/s.
+- Documented `IGC_EnableCodeSchedulingIfNoSpills=1` and
+  `IGC_CodeSchedulingForceMWOnly=1` were tested. The emitted `.dat` binary and
+  `.isaasm` matched the default dump byte-for-byte; the `.dat` SHA-256 was
+  `a21075fd21ce36f821e8ddcf3f7579a94702e9184a3af1e79ff2c0c9f19af1b9`.
+  `.instCount` remained 4044 and register/occupancy metadata did not change.
+  Expected gain for this build: none observed. IGC documents these
+  configuration flags as experimental.
+- As of this audit, NEO 26.35.39758.10 and IGC 2.41.5 are the latest upstream
+  releases. IGC 2.41.5's release notes cite the LLVM 22.1.8 update and no
+  specific Tiger Lake code-generation change ([NEO release](https://github.com/intel/compute-runtime/releases/tag/26.35.39758.10),
+  [IGC release](https://github.com/intel/intel-graphics-compiler/releases/tag/v2.41.5),
+  [IGC configuration flags](https://github.com/intel/intel-graphics-compiler/blob/v2.41.5/documentation/configuration_flags.md)).
+- No source change is justified by these results. The audit measured no
+  200 MH/s run and does not prove 200 MH/s unreachable in software. CPU usage
+  was not captured in these retest JSONL records; the prior 184.022 MH/s at
+  1.78% container CPU remains the low-CPU measurement recorded above.
