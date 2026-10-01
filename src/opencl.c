@@ -1065,6 +1065,8 @@ static int opencl_run_batch(const gbtc_work_batch_t *work, gbtc_backend_result_t
                          : opencl_run_batch_blocking(work, in, out);
     if (rc != 0) return -1;
 
+    result->raw_count = out[0];
+    result->overflow = out[0] > GBTC_MAX_FOUND_NONCES;
     result->count = out[0];
     if (result->count > GBTC_MAX_FOUND_NONCES) result->count = GBTC_MAX_FOUND_NONCES;
     for (uint32_t i = 0; i < result->count; i++) result->nonces[i] = out[1 + i];

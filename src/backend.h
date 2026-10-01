@@ -25,6 +25,11 @@ typedef struct {
     uint32_t count;
     uint32_t nonces[GBTC_MAX_FOUND_NONCES];
     uint64_t hashes_done;
+    // Raw GPU match counter, never clamped. overflow is set when raw_count
+    // exceeds storage: count then holds only the first GBTC_MAX_FOUND_NONCES
+    // nonces and the caller must rescan subranges to recover the rest.
+    uint32_t raw_count;
+    int overflow;
 } gbtc_backend_result_t;
 
 typedef struct gbtc_backend {

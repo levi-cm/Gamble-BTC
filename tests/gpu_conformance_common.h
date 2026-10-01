@@ -93,8 +93,9 @@ static int gbtc_conform_check_sorted_set_equal(const char *label, const char *wh
     return 0;
 }
 
-static int gbtc_conform_run_cases(const gbtc_backend_t *backend, const char *label,
-                                    uint32_t small_count)
+static int __attribute__((unused))
+gbtc_conform_run_cases(const gbtc_backend_t *backend, const char *label,
+                       uint32_t small_count)
 {
     int failures = 0;
     gbtc_work_batch_t work;

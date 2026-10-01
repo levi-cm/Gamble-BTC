@@ -332,6 +332,8 @@ static int cuda_run_batch(const gbtc_work_batch_t *work, gbtc_backend_result_t *
     rc = g_cu.MemcpyDtoH(out, g_buf_out, sizeof(out));
     if (rc != CUDA_SUCCESS) return -1;
 
+    result->raw_count = out[0];
+    result->overflow = out[0] > GBTC_MAX_FOUND_NONCES;
     result->count = out[0];
     if (result->count > GBTC_MAX_FOUND_NONCES) result->count = GBTC_MAX_FOUND_NONCES;
     for (uint32_t i = 0; i < result->count; i++) result->nonces[i] = out[1 + i];

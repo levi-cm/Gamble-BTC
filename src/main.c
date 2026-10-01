@@ -827,6 +827,8 @@ static int gles_run_batch(const gbtc_work_batch_t *work, gbtc_backend_result_t *
         LOG("glMapBufferRange err 0x%x", glGetError());
         return -1;
     }
+    result->raw_count = res->count;
+    result->overflow = res->count > GBTC_MAX_FOUND_NONCES;
     result->count = res->count;
     if (result->count > GBTC_MAX_FOUND_NONCES) result->count = GBTC_MAX_FOUND_NONCES;
     for (uint32_t i = 0; i < result->count; i++) result->nonces[i] = res->nonces[i];
@@ -1697,6 +1699,61 @@ static int run_gles_autotune_and_exit(const gbtc_backend_t *backend)
     return any_ok ? 0 : 2;
 }
 
+static void submit_checked_candidates(stratum_t *S, const char *job_id_snapshot,
+                                        const char *en2_hex, uint32_t ntime_snapshot,
+                                        const gbtc_work_batch_t *work,
+                                        const gbtc_backend_result_t *result)
+{
+    for (uint32_t i = 0; i < result->count; i++) {
+        uint8_t candidate_hash[32];
+        gbtc_work_hash(candidate_hash, work, result->nonces[i]);
+        if (gbtc_raw_hash_meets_target(candidate_hash, work->target)) {
+            stratum_submit(S, job_id_snapshot, en2_hex,
+                           ntime_snapshot, result->nonces[i]);
+        } else {
+            LOG("candidate nonce=%08x failed full share-target comparison",
+                result->nonces[i]);
+        }
+    }
+}
+
+// Recover candidates lost to output truncation: when the GPU reports more
+// matches than fit in storage, re-scan the batch in smaller quantum-aligned
+// chunks (which no longer overflow) and validate those candidates too.
+// Chunks partition the original range, so no nonce is counted twice.
+static void recover_overflow_candidates(const gbtc_backend_t *backend, stratum_t *S,
+                                        const char *job_id_snapshot, const char *en2_hex,
+                                        uint32_t ntime_snapshot,
+                                        const gbtc_work_batch_t *work,
+                                        const gbtc_backend_result_t *result,
+                                        uint32_t dispatch_quantum)
+{
+    uint32_t chunk = work->nonce_count / 16u;
+    if (chunk < dispatch_quantum) chunk = dispatch_quantum;
+    // Round down to a multiple of the quantum.
+    chunk -= chunk % dispatch_quantum;
+    if (chunk == 0) chunk = dispatch_quantum;
+    LOG("result overflow (raw=%u), rescanning %u nonces in %u-nonce chunks",
+        result->raw_count, work->nonce_count, chunk);
+    for (uint32_t off = 0; off < work->nonce_count && !g_stop; off += chunk) {
+        uint32_t n = work->nonce_count - off;
+        if (n > chunk) n = chunk;
+        gbtc_work_batch_t sub = *work;
+        sub.nonce_base = work->nonce_base + off;
+        sub.nonce_count = n;
+        gbtc_backend_result_t r = {0};
+        if (backend->run_batch(&sub, &r) != 0) {
+            LOG("overflow rescan batch failed at base=%08x", sub.nonce_base);
+            return;
+        }
+        submit_checked_candidates(S, job_id_snapshot, en2_hex, ntime_snapshot, &sub, &r);
+        if (r.overflow) {
+            LOG("rescan chunk still overflows (raw=%u); kept first %u",
+                r.raw_count, r.count);
+        }
+    }
+}
+
 int main(void) {
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
@@ -1817,16 +1874,12 @@ int main(void) {
                 break;
             }
 
-            for (uint32_t i = 0; i < result.count; i++) {
-                uint8_t candidate_hash[32];
-                gbtc_work_hash(candidate_hash, &work, result.nonces[i]);
-                if (gbtc_raw_hash_meets_target(candidate_hash, work.target)) {
-                    stratum_submit(&S, job_id_snapshot, en2_hex,
-                                   ntime_snapshot, result.nonces[i]);
-                } else {
-                    LOG("candidate nonce=%08x failed full share-target comparison",
-                        result.nonces[i]);
-                }
+            submit_checked_candidates(&S, job_id_snapshot, en2_hex,
+                                        ntime_snapshot, &work, &result);
+            if (result.overflow) {
+                recover_overflow_candidates(backend, &S, job_id_snapshot, en2_hex,
+                                            ntime_snapshot, &work, &result,
+                                            active_dispatch_quantum(backend));
             }
 
             total_hashes += result.hashes_done;

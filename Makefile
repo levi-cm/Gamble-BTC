@@ -7,7 +7,7 @@ TEST_LDFLAGS ?=
 
 SRC := src/main.c src/sha256.c src/backend.c src/gles_tuning.c src/opencl.c src/cuda.c src/bench.c src/stratum_protocol.c src/http_config.c
 OBJ := $(SRC:src/%.c=build/%.o)
-TEST_BINS := build/test_sha256 build/test_backend_selection build/test_gles_tuning build/test_bench_config build/test_ui_contract build/test_stratum_protocol build/test_http_config build/test_opencl_conformance build/test_cuda_conformance
+TEST_BINS := build/test_sha256 build/test_backend_selection build/test_gles_tuning build/test_bench_config build/test_ui_contract build/test_stratum_protocol build/test_http_config build/test_opencl_conformance build/test_cuda_conformance build/test_overflow_recovery
 
 .PHONY: all test test-scripts test-asan test-ubsan static-analysis clean
 
@@ -58,6 +58,11 @@ build/test_cuda_conformance: tests/test_cuda_conformance.c tests/gpu_conformance
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) $< src/cuda.c src/backend.c src/bench.c src/sha256.c -o $@ $(TEST_LDFLAGS)
 
+# GPU-gated: skips cleanly when no GPU backend is present.
+build/test_overflow_recovery: tests/test_overflow_recovery.c tests/gpu_conformance_common.h src/cuda.c src/cuda.h src/opencl.c src/opencl.h src/bench.c src/bench.h src/backend.h src/backend.c src/sha256.c src/sha256.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) $< src/cuda.c src/opencl.c src/backend.c src/bench.c src/sha256.c -o $@ $(TEST_LDFLAGS)
+
 test: $(TEST_BINS) test-scripts
 	./build/test_sha256
 	./build/test_backend_selection
@@ -68,6 +73,7 @@ test: $(TEST_BINS) test-scripts
 	./build/test_http_config
 	./build/test_opencl_conformance
 	./build/test_cuda_conformance
+	./build/test_overflow_recovery
 
 test-asan:
 	$(MAKE) clean
