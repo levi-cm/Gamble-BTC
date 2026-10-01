@@ -50,12 +50,23 @@ EOF
 
 # Compose readiness belongs to the exact selected and verified exit. Wait with
 # no hashing when both routes are unavailable. Direct Docker use can omit it.
+# Freshness window for the selected route. Missing/unparseable readiness
+# means both exits are down: stop immediately (no direct fallback). A stale
+# timestamp with the SAME exit id is verification lag (the sidecar
+# re-verifies about every 60 s; one slow curl cycle can exceed the window),
+# so tolerate a few consecutive stale reads before stopping. A fresh,
+# DIFFERENT id is a real failover/failback: stop at once so old work ends.
+GBTC_ROUTE_MAX_STALE_CHECKS=3
 route_id() {
     [ -s "$GBTC_EXIT_READY_FILE" ] || return 1
     jq -er --argjson now "$(date +%s)" '
         select(.mullvad_verified_at <= $now and
                ($now - .mullvad_verified_at) <= 100) | .id' \
         "$GBTC_EXIT_READY_FILE" 2>/dev/null
+}
+route_id_any() {
+    [ -s "$GBTC_EXIT_READY_FILE" ] || return 1
+    jq -er '.id' "$GBTC_EXIT_READY_FILE" 2>/dev/null
 }
 trap 'rm -f "$proxy_config"; exit 0' INT TERM
 if [ -n "${GBTC_EXIT_READY_FILE:-}" ]; then
@@ -89,11 +100,32 @@ cleanup() {
     rm -f "$proxy_config"
 }
 trap 'cleanup; exit 0' INT TERM
+stale_checks=0
 while kill -0 "$miner_pid" 2>/dev/null; do
     sleep 10 &
     wait "$!" || true
-    current_route=$(route_id) || current_route=
-    if [ "$current_route" != "$initial_route" ]; then
+    if current_route=$(route_id); then
+        stale_checks=0
+        if [ "$current_route" != "$initial_route" ]; then
+            cleanup
+            exit 75
+        fi
+        continue
+    fi
+    # Fresh-ID check failed: either the file is gone (both exits down) or
+    # the verification timestamp is stale. Missing means stop at once;
+    # a real failover to another exit also stops at once; pure staleness
+    # with the same exit is tolerated briefly.
+    if ! any_route=$(route_id_any); then
+        cleanup
+        exit 75
+    fi
+    if [ "$any_route" != "$initial_route" ]; then
+        cleanup
+        exit 75
+    fi
+    stale_checks=$((stale_checks + 1))
+    if [ "$stale_checks" -ge "${GBTC_ROUTE_MAX_STALE_CHECKS:-3}" ]; then
         cleanup
         exit 75
     fi

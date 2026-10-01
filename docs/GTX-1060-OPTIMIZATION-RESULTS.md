@@ -27,3 +27,8 @@
 - E07 (rejected): interleaved 2-nonce kernel, 606.2 MH/s — issue-bound,
   not latency-bound. Record: `scripts/gen-cuda-dual.py`, `bench-results/`
   cubin/logs, 9/9 hashlib oracle checks.
+- E08: batch 2^26 KEEP (cuda-256: 635.2 @ 0.21% CPU; ocl-256: 633.6 @ 0.88%).
+  Small batches REJECT (2^22: 619.6 @ 2.35%). cuda-128 REJECT (623.8).
+- E09 (running): 60-min production confirmation, cuda-256 + batch 2^26.
+- E10 (implemented, image `535d9b83` built, pending deploy): overflow flag +
+  subrange rescan recovery; GPU-gated test passes (raw=25 fully recovered).
