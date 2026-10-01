@@ -176,6 +176,9 @@ typedef struct {
     uint64_t target_generation;
     int pending_submit_ids[64];
     size_t pending_submit_count;
+    // Set when the socket fails or closes; cleared on (re)connect. The
+    // mining loop uses it to stop hashing stale work and reconnect.
+    bool socket_dead;
     // Current job
     bool have_job;
     char job_id[64];
@@ -227,6 +230,7 @@ static int stratum_connect(stratum_t *s, const char *url) {
     s->rxlen = 0;
     s->next_id = 1;
     s->have_job = false;
+    s->socket_dead = false;
     s->diff = 1.0;
     char target_reason[128] = "";
     if (gbtc_target_from_difficulty(s->diff, s->target,
@@ -300,8 +304,12 @@ static char *stratum_readline(stratum_t *s, int timeout_ms) {
         int r = select(s->fd + 1, &rfds, NULL, NULL, &tv);
         if (r <= 0) return NULL;
         ssize_t n = recv(s->fd, s->rxbuf + s->rxlen, sizeof(s->rxbuf) - s->rxlen - 1, 0);
-        if (n <= 0) { LOG("stratum closed (n=%zd)", n); return NULL; }
-        s->rxlen += n;
+        if (n <= 0) {
+            if (!s->socket_dead) LOG("stratum closed (n=%zd)", n);
+            s->socket_dead = true;
+            return NULL;
+        }
+        s->rxlen += (size_t)n;
     }
 }
 
@@ -482,6 +490,8 @@ static int stratum_submit(stratum_t *s, const char *job_id, const char *en2_hex,
     pthread_mutex_unlock(&m_mu);
     return 0;
 }
+
+static int stratum_reconnect(stratum_t *s, const char *url);
 
 // ============================================================================
 // Work building (coinbase + merkle root + header midstate)
@@ -852,6 +862,33 @@ const gbtc_backend_t gbtc_gles_backend = {
 // ============================================================================
 static volatile int g_stop = 0;
 static void on_sigint(int s){ (void)s; g_stop = 1; }
+
+// Drop a dead Stratum session and reconnect with backoff. Returns 0 when a
+// fresh authorized session is ready (have_job may still be false; the caller
+// waits for the first job), -1 when shutting down. Never hashes stale work:
+// the caller must abandon its current sweep after a reconnect.
+static int stratum_reconnect(stratum_t *s, const char *url)
+{
+    if (s->fd >= 0) { close(s->fd); s->fd = -1; }
+    s->rxlen = 0;
+    s->have_job = false;
+    s->pending_submit_count = 0;
+    s->socket_dead = false;
+    unsigned backoff = 5;
+    while (!g_stop) {
+        LOG("stratum: reconnecting to %s in %us", url, backoff);
+        for (unsigned i = 0; i < backoff && !g_stop; i++) sleep(1);
+        if (g_stop) return -1;
+        if (stratum_connect(s, url) == 0 &&
+            stratum_subscribe_authorize(s) == 0) {
+            LOG("stratum: reconnected");
+            return 0;
+        }
+        if (s->fd >= 0) { close(s->fd); s->fd = -1; }
+        if (backoff < 60) backoff *= 2;
+    }
+    return -1;
+}
 
 // ============================================================================
 // HTTP server (live hashrate UI). Single pthread accept loop, per-client
@@ -1837,6 +1874,10 @@ int main(void) {
     while (!g_stop) {
         // Drain incoming stratum messages (non-blocking-ish)
         stratum_pump(&S, 0);
+        if (S.socket_dead) {
+            if (stratum_reconnect(&S, url) != 0) break;
+            continue;
+        }
         if (!S.have_job) { stratum_pump(&S, 1000); continue; }
 
         // Build current work: pick fresh extranonce2
@@ -1905,6 +1946,10 @@ int main(void) {
 
             // Check for new job mid-sweep
             stratum_pump(&S, 0);
+            if (S.socket_dead) {
+                if (stratum_reconnect(&S, url) != 0) break;
+                break;
+            }
             if (S.target_generation != target_generation_snapshot) {
                 LOG("difficulty changed, abandoning sweep");
                 break;

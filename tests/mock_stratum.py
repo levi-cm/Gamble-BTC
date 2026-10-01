@@ -19,9 +19,10 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 43333
 SECONDS = int(sys.argv[2]) if len(sys.argv) > 2 else 180
 
 DIFF = 1.0
-# diff-1 target as 8 big-endian words, target[0] is most significant
-TARGET = [0x00000000, 0x00000000, 0x00000000, 0x00000000,
-          0x00000000, 0x00000000, 0x0000ffff, 0x00000000]
+# diff-1 target words exactly as gbtc_target_from_difficulty(1.0) produces
+# (target[0] compared first; verified against the C implementation).
+TARGET = [0x00000000, 0xffff0000, 0x00000000, 0x00000000,
+          0x00000000, 0x00000000, 0x00000000, 0x00000000]
 EN1 = "00112233"
 JOB1 = {"id": "mockjob1", "prev": "00" * 32,
         "cb1": "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0101",

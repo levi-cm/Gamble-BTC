@@ -26,6 +26,11 @@ primary_successes=0
 # cycle) must not flip the exit. Fall back only after two consecutive
 # primary failures; any primary success resets the count.
 primary_failures=0
+# Transition logging (observability only): record why the exit changes.
+note_transition() {
+    printf 'gbtc-route: active=%s failures=%s event=%s\n' \
+        "${active_node:-none}" "$primary_failures" "$1"
+}
 while kill -0 "$daemon_pid" 2>/dev/null; do
     status=$(timeout 5 tailscale status --json 2>/dev/null) || status='{}'
     if ! printf '%s' "$status" | jq -e '.BackendState == "Running"' >/dev/null; then
@@ -90,6 +95,9 @@ while kill -0 "$daemon_pid" 2>/dev/null; do
             verified_at=$now
         fi
         chosen=$node
+        if [ "${active_node:-none}" != "$node" ]; then
+            note_transition "select $node"
+        fi
         active_node=$node
         [ "$node" = "$primary" ] && primary_failures=0
         jq -n --arg node "$node" --arg id "$id" --argjson verified "$verified_at" \

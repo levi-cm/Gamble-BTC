@@ -54,6 +54,7 @@ int main(void)
     int failures = 0;
     failures += check_block("64");
     failures += check_block("256");
+    failures += check_block("512");
     if (failures == 0) printf("cuda conformance passed\n");
     return failures ? 1 : 0;
 }
