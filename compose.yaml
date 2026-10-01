@@ -44,6 +44,7 @@ services:
       GBTC_OPENCL_SIMD: ${GBTC_OPENCL_SIMD:-auto}
       GBTC_OPENCL_POLL_US: ${GBTC_OPENCL_POLL_US:-1000}
       GBTC_OPENCL_PLATFORM: ${GBTC_OPENCL_PLATFORM:-NVIDIA}
+      GBTC_CUDA_BLOCK: ${GBTC_CUDA_BLOCK:-64}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       # Optional IGC compiler knob; unset by default.
       IGC_ForceOCLSIMDWidth: ${GBTC_IGC_FORCE_SIMD:-}

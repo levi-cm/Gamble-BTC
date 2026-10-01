@@ -15,4 +15,15 @@
 
 ## Milestones
 
-- M1 (pending): NVIDIA harness + thermal guard + baseline correctness gates.
+- M1 (pushed `4c3bb6e`): NVIDIA harness + thermal guard + baseline correctness gates.
+- M2 (pushed `c78a054`): Pascal sm_61 CUDA backend (Driver API, blocking sync).
+  ABBA: cuda-256 631.98/631.89 @ 0.65–0.69% CPU vs ocl-256 631.51/630.54 @
+  1.18%. Shared conformance core passes for both backends. Full `make test`
+  exit 0. Rollback image tagged `gamble-btc:rollback-vpn-20261001`.
+- E06 live (running): cuda/256 in production, ~630–632 MH/s, miner CPU 0.750%
+  of one core over 60 s (sidecar 1.404% separately), GPU 73–74 C, 1835 MHz,
+  ~108 W, no throttle flags. Submits: none yet (expected ~1 per 19 h at
+  pool diff 10000; mock-Stratum easy-target test still to do).
+- E07 (rejected): interleaved 2-nonce kernel, 606.2 MH/s — issue-bound,
+  not latency-bound. Record: `scripts/gen-cuda-dual.py`, `bench-results/`
+  cubin/logs, 9/9 hashlib oracle checks.
