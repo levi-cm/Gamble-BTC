@@ -32,3 +32,11 @@
 - E09 (running): 60-min production confirmation, cuda-256 + batch 2^26.
 - E10 (implemented, image `535d9b83` built, pending deploy): overflow flag +
   subrange rescan recovery; GPU-gated test passes (raw=25 fully recovered).
+- E11 (PASS): mock pool at diff 1.0 — 15 submits, 15 verified, 0 bad, both
+  jobs; clean-job switch proven. Mock target now matches repo vector.
+- E14 (PASS, deployed in `10282bf0`): dead-socket reconnect with backoff;
+  kill/restart test gives 16/16 verified, 0 bad, no spin.
+- E15: cuda-512 KEEP (+3.9% repeatable, 657-658 vs 632; conformance passes).
+  pre3 REJECT on both APIs (629.7, no gain).
+- E09g (running): production cuda/512 + batch 2^26, ~662 MH/s, miner CPU
+  0.281% (stretch target met), sidecar 1.38% separately, 74-75 C.
