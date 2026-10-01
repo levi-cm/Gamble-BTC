@@ -1,45 +1,61 @@
 services:
+  tailscale:
+    build:
+      context: .
+      dockerfile: Dockerfile.tailscale
+    image: gamble-btc-tailscale:latest
+    container_name: gamble-btc-tailscale
+    environment:
+      GBTC_EXIT_PRIMARY: ${GBTC_EXIT_PRIMARY:-max-vprouter.dinosaur-dojo.ts.net}
+      GBTC_EXIT_FALLBACK: ${GBTC_EXIT_FALLBACK:-nico-vpn.dinosaur-dojo.ts.net}
+    ports:
+      - "${GBTC_STATUS_BIND:-127.0.0.1}:41174:41174"
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - exit-readiness:/run/gbtc-route
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gbtc-tailscale-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
   miner:
     build: .
     image: gamble-btc:latest
     container_name: gamble-btc
-    # Host device nodes move between boots (card0 vs card1); override with
-    # GBTC_DRI_CARD=/dev/dri/cardX when needed. renderD128 is usually stable.
-    devices:
-      - "${GBTC_DRI_CARD:-/dev/dri/card1}:/dev/dri/card1"
-      - "${GBTC_DRI_RENDER:-/dev/dri/renderD128}:/dev/dri/renderD128"
-    # Match this laptop (video=983, render=987); HD 4600 legacy was 44/992.
-    group_add:
-      - "${VIDEO_GID:-983}"
-      - "${RENDER_GID:-987}"
-    ports:
-      - "127.0.0.1:41174:41174"
+    gpus: all
+    network_mode: service:tailscale
+    depends_on:
+      tailscale:
+        condition: service_healthy
     env_file:
       - .env
     environment:
+      GBTC_SOCKS5_HOST: 127.0.0.1
+      GBTC_SOCKS5_PORT: 1055
+      GBTC_VERIFY_MULLVAD: "1"
+      GBTC_EXIT_READY_FILE: /run/gbtc-route/ready.json
       GBTC_BACKEND: ${GBTC_BACKEND:-opencl}
-      GBTC_DEVICE: ${GBTC_DEVICE:-/dev/dri/renderD128}
       GBTC_GLES_KERNEL: ${GBTC_GLES_KERNEL:-altbool}
       GBTC_GLES_LOCAL_SIZE: ${GBTC_GLES_LOCAL_SIZE:-16}
       GBTC_OPENCL_LOCAL_SIZE: ${GBTC_OPENCL_LOCAL_SIZE:-64}
       GBTC_OPENCL_KERNEL: ${GBTC_OPENCL_KERNEL:-unrolled}
       GBTC_OPENCL_SIMD: ${GBTC_OPENCL_SIMD:-auto}
       GBTC_OPENCL_POLL_US: ${GBTC_OPENCL_POLL_US:-1000}
+      GBTC_OPENCL_PLATFORM: ${GBTC_OPENCL_PLATFORM:-NVIDIA}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       # Optional IGC compiler knob; unset by default.
       IGC_ForceOCLSIMDWidth: ${GBTC_IGC_FORCE_SIMD:-}
       GBTC_BATCH_NONCES: ${GBTC_BATCH_NONCES:-16777216}
       GBTC_BENCH_SECONDS: ${GBTC_BENCH_SECONDS:-60}
       GBTC_BENCH_WARMUP_SECONDS: ${GBTC_BENCH_WARMUP_SECONDS:-5}
       GBTC_GLES_AUTOTUNE: ${GBTC_GLES_AUTOTUNE:-0}
-      MESA_NO_ERROR: 1
-      MESA_LOADER_DRIVER_OVERRIDE: iris
-      MESA_SHADER_CACHE_DIR: /home/miner/.cache/mesa_shader_cache
-      MESA_SHADER_CACHE_MAX_SIZE: 1G
-      RUSTICL_ENABLE: iris
     volumes:
       - mesa-shader-cache:/home/miner/.cache/mesa_shader_cache
-    # Feeder/stratum/UI threads are light; cap CPU so the iGPU keeps thermal
-    # headroom. memlock unlimited for GPU buffer pinning.
+      - exit-readiness:/run/gbtc-route:ro
+    # Feeder/stratum/UI threads are light; cap CPU. memlock unlimited for GPU
+    # buffer pinning.
     cpus: "4.0"
     mem_limit: 4g
     mem_reservation: 1g
@@ -52,3 +68,5 @@ services:
 
 volumes:
   mesa-shader-cache:
+  tailscale-state:
+  exit-readiness:

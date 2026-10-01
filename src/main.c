@@ -1368,6 +1368,9 @@ static void set_selected_backend_status(const gbtc_backend_t *backend, const cha
 {
     snprintf(g_backend, sizeof(g_backend), "%s", backend ? backend->name : "unknown");
     snprintf(g_backend_api, sizeof(g_backend_api), "%s", backend ? backend->api : "none");
+    if (backend && backend->kind == GBTC_BACKEND_OPENCL) {
+        g_device_path[0] = '\0';
+    }
     snprintf(g_fallback_reason, sizeof(g_fallback_reason), "%s", fallback_reason ? fallback_reason : "");
 }
 
@@ -1401,12 +1404,12 @@ static const gbtc_backend_t *select_backend_or_die(const char *requested)
             LOG("backend probe: %s rejected (%s)", backend->name, reason);
             append_rejection(rejection_summary, sizeof(rejection_summary), backend->name, reason);
         }
-        DIE("no usable iGPU backend found (%s)", rejection_summary);
+        DIE("no usable GPU backend found (%s)", rejection_summary);
     }
 
     gbtc_backend_kind_t kind;
     if (gbtc_parse_backend_kind(requested, &kind) != 0) {
-        DIE("GBTC_BACKEND must be auto, gles, vulkan, or opencl; this is an iGPU-only miner and CPU mining is intentionally not implemented");
+        DIE("GBTC_BACKEND must be auto, gles, vulkan, or opencl; this is a GPU-only miner and CPU mining is intentionally not implemented");
     }
     const gbtc_backend_t *backend = backend_for_kind(kind);
     char reason[512] = "";
@@ -1428,7 +1431,7 @@ static int print_probe_only(const char *requested)
     if (!gbtc_backend_is_auto(requested)) {
         gbtc_backend_kind_t kind;
         if (gbtc_parse_backend_kind(requested, &kind) != 0) {
-            fprintf(stderr, "GBTC_BACKEND must be auto, gles, vulkan, or opencl; this is an iGPU-only miner and CPU mining is intentionally not implemented\n");
+            fprintf(stderr, "GBTC_BACKEND must be auto, gles, vulkan, or opencl; this is a GPU-only miner and CPU mining is intentionally not implemented\n");
             return 2;
         }
         const gbtc_backend_t *backend = backend_for_kind(kind);

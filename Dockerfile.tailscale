@@ -1,0 +1,6 @@
+FROM tailscale/tailscale@sha256:8c42c4574ab066384fcb72f69e086a2ff1dd3652eb6f56856cee34bcf0d2f680
+RUN apk add --no-cache curl jq
+COPY scripts/tailscale-entrypoint.sh /usr/local/bin/gbtc-tailscale-entrypoint
+COPY scripts/tailscale-health.sh /usr/local/bin/gbtc-tailscale-health
+RUN chmod 755 /usr/local/bin/gbtc-tailscale-entrypoint /usr/local/bin/gbtc-tailscale-health
+ENTRYPOINT ["/usr/local/bin/gbtc-tailscale-entrypoint"]

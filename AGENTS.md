@@ -1,11 +1,17 @@
 # Repository Guidelines
 
+## Branch Workflow
+
+- Do all work in this repository on `gtx-1060-6gb`.
+- Never switch to, merge into, commit on, or publish `main` for this project.
+
 ## Project Structure & Module Organization
 
 This repository is a compact experimental Bitcoin solo-miner prototype. The main
 runtime remains in `src/main.c`: Stratum handling, work construction, the GLES
-iGPU backend, mining control, and the local HTTP status UI. This is an iGPU-only
-miner; do not add a CPU mining backend. Reusable SHA-256 and
+and OpenCL GPU backends, mining control, and the local HTTP status UI. This is
+a GPU-only miner; do not add a CPU mining backend. The `gtx-1060-6gb` branch
+targets the NVIDIA GeForce GTX 1060 6GB through OpenCL. Reusable SHA-256 and
 backend-selection helpers live in `src/sha256.*` and `src/backend.*`. Container
 build and runtime wiring are in `Dockerfile`, `Makefile`, and `compose.yaml`.
 Documentation lives under `docs/`, with support process files in `.github/`,
@@ -20,15 +26,15 @@ Documentation lives under `docs/`, with support process files in `.github/`,
   development headers.
 - `docker compose build`: compile the `src/` C sources in the Debian build stage
   and create `gamble-btc:latest`.
-- `GBTC_PROBE_ONLY=1 docker compose run --rm miner`: probe iGPU backend
+- `GBTC_PROBE_ONLY=1 docker compose run --rm miner`: probe NVIDIA OpenCL
   availability and exit without connecting to a pool.
 - `docker compose up -d`: start the hardware-specific miner container.
 - `docker compose logs -f`: follow runtime, Stratum, EGL/GLES, and mining logs.
 - `docker compose down`: stop and remove the running service.
 
 The status UI is exposed at `http://localhost:41174/` when the service is
-running. The current Compose file is host-specific and expects `/dev/dri/card0`,
-`/dev/dri/renderD128`, group `44`, and group `992`.
+running. Compose passes the NVIDIA GPU through with `gpus: all`; the host needs
+working NVIDIA drivers and NVIDIA Container Toolkit support in Docker.
 
 ## Coding Style & Naming Conventions
 
@@ -42,11 +48,11 @@ hardware, driver, or container assumptions.
 
 Use `make test` for deterministic C helper coverage, then verify container
 changes with `docker compose config --quiet` and `docker compose build`; inspect
-GCC warnings. Runtime verification should include the tested iGPU, kernel,
-Mesa/vendor driver, Docker version, device paths, Stratum behavior, logs, and
-status page behavior. CPU mining backends are intentionally out of scope because
-they would defeat the low-CPU-load iGPU goal; host-side hash code is only a
-correctness helper for work construction and tests.
+GCC warnings. Runtime verification should include the GTX 1060, NVIDIA driver,
+Docker GPU passthrough, OpenCL device selection, Stratum behavior, logs, and
+status page behavior. CPU mining backends are intentionally out of scope;
+host-side hash code is only a correctness helper for work construction and
+tests.
 
 ## Commit & Pull Request Guidelines
 

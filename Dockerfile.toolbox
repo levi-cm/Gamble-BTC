@@ -1,0 +1,13 @@
+# CUDA 13 cannot compile Pascal. Keep this developer image on CUDA 12.x.
+FROM nvidia/cuda:12.9.1-devel-ubuntu24.04@sha256:020bc241a628776338f4d4053fed4c38f6f7f3d7eb5919fecb8de313bb8ba47c
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential clang llvm lld pkg-config git ca-certificates curl \
+        python3 jq bash shellcheck cppcheck gdb valgrind binutils \
+        procps psmisc sysstat time strace \
+        libegl-dev libgles-dev libcjson-dev ocl-icd-opencl-dev clinfo \
+        libvulkan-dev vulkan-tools glslang-tools spirv-tools \
+        rustc cargo rustfmt rust-clippy \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace
+CMD ["bash"]
