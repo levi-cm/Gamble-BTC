@@ -50,6 +50,11 @@ case "$1" in
         for last do :; done
         case "$last" in
             100.1.1.1)
+                # Single-transient failure injection: fail exactly one ping.
+                if [ -f "$state/primary-flake" ]; then
+                    rm -f "$state/primary-flake"
+                    exit 1
+                fi
                 [ ! -f "$state/primary-offline" ] || exit 1
                 count=$(cat "$state/primary-successes")
                 printf '%s' "$((count + 1))" >"$state/primary-successes"
@@ -147,3 +152,14 @@ if sh "$test_root/health.sh"; then
     exit 1
 fi
 printf 'both exits offline: readiness denied and exit preference retained\n'
+
+reset_case
+start_case
+expect_ready p
+touch "$GBTC_TEST_STATE/primary-flake"
+# One failed primary check must not flip the exit; the next check recovers.
+# (With the old immediate failover this selected fallback.)
+/bin/sleep 0.5
+[ "$(jq -r .id "$test_root/ready.json")" = p ]
+[ "$(cat "$GBTC_TEST_STATE/selected")" = p ]
+printf 'single transient primary failure keeps primary exit\n'

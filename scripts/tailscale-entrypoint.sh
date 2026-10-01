@@ -22,6 +22,10 @@ trap cleanup EXIT
 active_node=
 verified_at=0
 primary_successes=0
+# Failover hysteresis: one failed primary check (a single slow ping or curl
+# cycle) must not flip the exit. Fall back only after two consecutive
+# primary failures; any primary success resets the count.
+primary_failures=0
 while kill -0 "$daemon_pid" 2>/dev/null; do
     status=$(timeout 5 tailscale status --json 2>/dev/null) || status='{}'
     if ! printf '%s' "$status" | jq -e '.BackendState == "Running"' >/dev/null; then
@@ -34,19 +38,25 @@ while kill -0 "$daemon_pid" 2>/dev/null; do
     # successful encrypted Tailscale ping. Never clear the exit-node preference.
     chosen=
     for node in "$primary" "$fallback"; do
+        # Only leave a working primary for fallback after repeated failures.
+        # (Reaching this iteration means primary failed this round.)
+        if [ "$node" != "$primary" ] && [ "$active_node" != "$fallback" ] &&
+           [ "$primary_failures" -lt 2 ]; then
+            continue
+        fi
         peer=$(printf '%s' "$status" | jq -c --arg node "$node" '
             first((.Peer // {})[] |
                 select((.DNSName | rtrimstr(".")) == $node) |
                 select(.ExitNodeOption == true and .Online == true)) // empty')
         if [ -z "$peer" ]; then
-            [ "$node" != "$primary" ] || primary_successes=0
+            [ "$node" != "$primary" ] || { primary_successes=0; primary_failures=$((primary_failures + 1)); }
             continue
         fi
         ip=$(printf '%s' "$peer" | jq -r 'first(.TailscaleIPs[] | select(contains(":") | not)) // empty')
-        [ -n "$ip" ] || continue
+        [ -n "$ip" ] || { [ "$node" != "$primary" ] || primary_failures=$((primary_failures + 1)); continue; }
         if ! timeout 5 tailscale ping --tsmp --c=1 --timeout=3s \
             --until-direct=false "$ip" >/dev/null 2>&1; then
-            [ "$node" != "$primary" ] || primary_successes=0
+            [ "$node" != "$primary" ] || { primary_successes=0; primary_failures=$((primary_failures + 1)); }
             continue
         fi
 
@@ -74,12 +84,14 @@ while kill -0 "$daemon_pid" 2>/dev/null; do
                 https://am.i.mullvad.net/json 2>/dev/null) || result='{}'
             if ! printf '%s' "$result" | jq -e '.mullvad_exit_ip == true' >/dev/null; then
                 rm -f "$ready"
+                [ "$node" != "$primary" ] || primary_failures=$((primary_failures + 1))
                 continue
             fi
             verified_at=$now
         fi
         chosen=$node
         active_node=$node
+        [ "$node" = "$primary" ] && primary_failures=0
         jq -n --arg node "$node" --arg id "$id" --argjson verified "$verified_at" \
             '{node:$node,id:$id,mullvad_verified_at:$verified}' >"${ready}.tmp"
         mv "${ready}.tmp" "$ready"
