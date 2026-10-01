@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
  && useradd -m -u 1000 miner
 COPY --from=build /src/miner /usr/local/bin/miner
+COPY --from=build /src/src/cuda/gbtc_mine.sm61.cubin /usr/local/share/gbtc/gbtc_mine.sm61.cubin
 COPY scripts/container-entrypoint.sh /usr/local/bin/gbtc-entrypoint
 RUN chmod 755 /usr/local/bin/gbtc-entrypoint
 USER miner

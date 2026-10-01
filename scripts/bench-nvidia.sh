@@ -10,8 +10,8 @@
 # Env knobs (all explicit, no host forwarding):
 #   IMAGE (default gamble-btc:latest), TAG (required),
 #   GBTC_OPENCL_KERNEL, GBTC_OPENCL_LOCAL_SIZE, GBTC_OPENCL_SIMD,
-#   GBTC_OPENCL_POLL_US, GBTC_BATCH_NONCES, GBTC_BENCH_SECONDS,
-#   GBTC_BENCH_WARMUP_SECONDS, OUTDIR (default bench-results/campaign-20261001)
+#   GBTC_OPENCL_POLL_US, GBTC_CUDA_BLOCK, GBTC_BATCH_NONCES, GBTC_BENCH_SECONDS,
+#   GBTC_BENCH_WARMUP_SECONDS, GBTC_BACKEND, OUTDIR (default bench-results/campaign-20261001)
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 OUTDIR="${OUTDIR:-bench-results/campaign-20261001}"
@@ -19,6 +19,8 @@ LOCK="$OUTDIR/gpu-workload.lock"
 STOPFLAG="$OUTDIR/thermal-stop.flag"
 IMAGE="${IMAGE:-gamble-btc:latest}"
 TAG="${TAG:?TAG is required}"
+BACKEND="${GBTC_BACKEND:-opencl}"
+CUBLOCK="${GBTC_CUDA_BLOCK:-64}"
 KERNEL="${GBTC_OPENCL_KERNEL:-unrolled}"
 LOCAL="${GBTC_OPENCL_LOCAL_SIZE:-64}"
 SIMD="${GBTC_OPENCL_SIMD:-auto}"
@@ -28,7 +30,7 @@ SECS="${GBTC_BENCH_SECONDS:-60}"
 WARMUP="${GBTC_BENCH_WARMUP_SECONDS:-5}"
 mkdir -p "$OUTDIR"
 CSV="$OUTDIR/bench-trials.csv"
-[ -f "$CSV" ] || echo "ts_utc,tag,image,kernel,local,simd,poll_us,batch,bench_s,warmup_s,mh_s,hashes,seconds,ok,cpu_pct_one_core,temp_before,temp_after,sm_mhz,power_w,note" > "$CSV"
+[ -f "$CSV" ] || echo "ts_utc,tag,image,backend,kernel_ocl,local_ocl,simd,poll_us,cublock,batch,bench_s,warmup_s,mh_s,hashes,seconds,ok,cpu_steady_pct,cpu_full_pct,temp_before,temp_after,sm_mhz,power_w,note" > "$CSV"
 
 snap() { nvidia-smi --query-gpu=temperature.gpu,clocks.current.sm,power.draw --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' '; }
 
@@ -41,7 +43,7 @@ if docker ps --format '{{.Names}}' | grep -q '^gbtc-bench-'; then echo "REFUSE: 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 NAME="gbtc-bench-${TAG}-${TS}"
 echo "container:$NAME" > "$LOCK"
-echo "[harness] start $NAME image=$IMAGE kernel=$KERNEL local=$LOCAL batch=$BATCH secs=$SECS temp=$TEMP0"
+echo "[harness] start $NAME image=$IMAGE backend=$BACKEND kernel=$KERNEL local=$LOCAL cublock=$CUBLOCK batch=$BATCH secs=$SECS temp=$TEMP0"
 
 cleanup() { rm -f "$LOCK"; }
 trap cleanup EXIT
@@ -51,9 +53,10 @@ proc_cpu_ticks() {
   awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo ""
 }
 CID="$(docker run -d --gpus all --network none --name "$NAME" \
-  -e GBTC_BACKEND=opencl -e GBTC_BENCH_ONLY=1 -e GBTC_PROBE_ONLY=0 \
+  -e "GBTC_BACKEND=$BACKEND" -e GBTC_BENCH_ONLY=1 -e GBTC_PROBE_ONLY=0 \
   -e "GBTC_OPENCL_KERNEL=$KERNEL" -e "GBTC_OPENCL_LOCAL_SIZE=$LOCAL" \
   -e "GBTC_OPENCL_SIMD=$SIMD" -e "GBTC_OPENCL_POLL_US=$POLL" \
+  -e "GBTC_CUDA_BLOCK=$CUBLOCK" \
   -e "GBTC_BATCH_NONCES=$BATCH" -e "GBTC_BENCH_SECONDS=$SECS" \
   -e "GBTC_BENCH_WARMUP_SECONDS=$WARMUP" \
   --entrypoint /usr/local/bin/miner "$IMAGE" 2>&1 | tail -n1)"
@@ -86,5 +89,5 @@ HASHES="$(echo "$JSON" | grep -o '"hashes":[0-9]*' | cut -d: -f2)"
 SECSS="$(echo "$JSON" | grep -o '"seconds":[0-9.]*' | cut -d: -f2)"
 OK="$(echo "$JSON" | grep -o '"ok":[a-z]*' | cut -d: -f2)"
 SMPOW="$(echo "$AFTER" | cut -d, -f2,3)"
-echo "$TS,$TAG,$IMAGE,$KERNEL,$LOCAL,$SIMD,$POLL,$BATCH,$SECS,$WARMUP,${MH:-?},${HASHES:-?},${SECSS:-?},${OK:-?},${CPU_STEADY:-?},$CPU_PCT,${TEMP0:-?},${TEMP1:-?},${SMPOW:-?}," >> "$CSV"
+echo "$TS,$TAG,$IMAGE,$BACKEND,$KERNEL,$LOCAL,$SIMD,$POLL,$CUBLOCK,$BATCH,$SECS,$WARMUP,${MH:-?},${HASHES:-?},${SECSS:-?},${OK:-?},${CPU_STEADY:-?},$CPU_PCT,${TEMP0:-?},${TEMP1:-?},${SMPOW:-?}," >> "$CSV"
 echo "[harness] done mh_s=${MH:-?} ok=${OK:-?} cpu_steady=${CPU_STEADY:-?}% cpu_full=${CPU_PCT}% t=${TEMP0:-?}->${TEMP1:-?}C"

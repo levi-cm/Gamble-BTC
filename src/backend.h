@@ -9,7 +9,8 @@
 typedef enum {
     GBTC_BACKEND_GLES,
     GBTC_BACKEND_VULKAN,
-    GBTC_BACKEND_OPENCL
+    GBTC_BACKEND_OPENCL,
+    GBTC_BACKEND_CUDA
 } gbtc_backend_kind_t;
 
 typedef struct {
@@ -43,5 +44,6 @@ int gbtc_backend_is_auto(const char *name);
 extern const gbtc_backend_t gbtc_vulkan_backend;
 extern const gbtc_backend_t gbtc_gles_backend;
 extern const gbtc_backend_t gbtc_opencl_backend;
+extern const gbtc_backend_t gbtc_cuda_backend;
 
 #endif

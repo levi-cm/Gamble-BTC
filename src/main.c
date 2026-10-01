@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include "bench.h"
 #include "backend.h"
+#include "cuda.h"
 #include "gles_tuning.h"
 #include "opencl.h"
 #include "http_config.h"
@@ -1353,6 +1354,7 @@ static const gbtc_backend_t *backend_for_kind(gbtc_backend_kind_t kind)
     case GBTC_BACKEND_GLES: return &gbtc_gles_backend;
     case GBTC_BACKEND_VULKAN: return &gbtc_vulkan_backend;
     case GBTC_BACKEND_OPENCL: return &gbtc_opencl_backend;
+    case GBTC_BACKEND_CUDA: return &gbtc_cuda_backend;
     }
     return NULL;
 }
@@ -1369,6 +1371,9 @@ static void set_selected_backend_status(const gbtc_backend_t *backend, const cha
     snprintf(g_backend, sizeof(g_backend), "%s", backend ? backend->name : "unknown");
     snprintf(g_backend_api, sizeof(g_backend_api), "%s", backend ? backend->api : "none");
     if (backend && backend->kind == GBTC_BACKEND_OPENCL) {
+        g_device_path[0] = '\0';
+    }
+    if (backend && backend->kind == GBTC_BACKEND_CUDA) {
         g_device_path[0] = '\0';
     }
     snprintf(g_fallback_reason, sizeof(g_fallback_reason), "%s", fallback_reason ? fallback_reason : "");
@@ -1388,6 +1393,7 @@ static const gbtc_backend_t *select_backend_or_die(const char *requested)
     const gbtc_backend_t *priority[] = {
         &gbtc_gles_backend,
         &gbtc_opencl_backend,
+        &gbtc_cuda_backend,
         &gbtc_vulkan_backend,
     };
     char rejection_summary[512] = "";
@@ -1409,7 +1415,7 @@ static const gbtc_backend_t *select_backend_or_die(const char *requested)
 
     gbtc_backend_kind_t kind;
     if (gbtc_parse_backend_kind(requested, &kind) != 0) {
-        DIE("GBTC_BACKEND must be auto, gles, vulkan, or opencl; this is a GPU-only miner and CPU mining is intentionally not implemented");
+        DIE("GBTC_BACKEND must be auto, gles, vulkan, opencl, or cuda; this is a GPU-only miner and CPU mining is intentionally not implemented");
     }
     const gbtc_backend_t *backend = backend_for_kind(kind);
     char reason[512] = "";
@@ -1425,13 +1431,14 @@ static int print_probe_only(const char *requested)
     const gbtc_backend_t *priority[] = {
         &gbtc_gles_backend,
         &gbtc_opencl_backend,
+        &gbtc_cuda_backend,
         &gbtc_vulkan_backend,
     };
     init_device_path_status();
     if (!gbtc_backend_is_auto(requested)) {
         gbtc_backend_kind_t kind;
         if (gbtc_parse_backend_kind(requested, &kind) != 0) {
-            fprintf(stderr, "GBTC_BACKEND must be auto, gles, vulkan, or opencl; this is a GPU-only miner and CPU mining is intentionally not implemented\n");
+            fprintf(stderr, "GBTC_BACKEND must be auto, gles, vulkan, opencl, or cuda; this is a GPU-only miner and CPU mining is intentionally not implemented\n");
             return 2;
         }
         const gbtc_backend_t *backend = backend_for_kind(kind);
@@ -1498,6 +1505,9 @@ static uint32_t active_dispatch_quantum(const gbtc_backend_t *backend)
     if (backend && backend->kind == GBTC_BACKEND_OPENCL) {
         return gbtc_opencl_active_local_size();
     }
+    if (backend && backend->kind == GBTC_BACKEND_CUDA) {
+        return gbtc_cuda_active_block_size();
+    }
     return 64u;
 }
 
@@ -1509,6 +1519,9 @@ static const char *active_gles_kernel_name(const gbtc_backend_t *backend)
     if (backend && backend->kind == GBTC_BACKEND_OPENCL) {
         return gbtc_opencl_kernel_name();
     }
+    if (backend && backend->kind == GBTC_BACKEND_CUDA) {
+        return gbtc_cuda_kernel_name();
+    }
     return "";
 }
 
@@ -1516,6 +1529,7 @@ static uint32_t active_gles_local_size(const gbtc_backend_t *backend)
 {
     if (backend && backend->kind == GBTC_BACKEND_GLES) return gles_config.local_size;
     if (backend && backend->kind == GBTC_BACKEND_OPENCL) return gbtc_opencl_active_local_size();
+    if (backend && backend->kind == GBTC_BACKEND_CUDA) return gbtc_cuda_active_block_size();
     return 0;
 }
 
@@ -1710,6 +1724,13 @@ int main(void) {
     if (backend->kind == GBTC_BACKEND_OPENCL) {
         const char *vendor = NULL, *name = NULL, *version = NULL;
         gbtc_opencl_device_strings(&vendor, &name, &version);
+        snprintf(g_device_vendor, sizeof(g_device_vendor), "%s", vendor);
+        snprintf(g_device_name, sizeof(g_device_name), "%s", name);
+        snprintf(g_driver_name, sizeof(g_driver_name), "%s", version);
+    }
+    if (backend->kind == GBTC_BACKEND_CUDA) {
+        const char *vendor = NULL, *name = NULL, *version = NULL;
+        gbtc_cuda_device_strings(&vendor, &name, &version);
         snprintf(g_device_vendor, sizeof(g_device_vendor), "%s", vendor);
         snprintf(g_device_name, sizeof(g_device_name), "%s", name);
         snprintf(g_driver_name, sizeof(g_driver_name), "%s", version);

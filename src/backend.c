@@ -9,6 +9,7 @@ const char *gbtc_backend_kind_name(gbtc_backend_kind_t kind)
     case GBTC_BACKEND_GLES: return "gles";
     case GBTC_BACKEND_VULKAN: return "vulkan";
     case GBTC_BACKEND_OPENCL: return "opencl";
+    case GBTC_BACKEND_CUDA: return "cuda";
     }
     return "unknown";
 }
@@ -31,6 +32,10 @@ int gbtc_parse_backend_kind(const char *name, gbtc_backend_kind_t *kind)
     }
     if (strcmp(name, "opencl") == 0) {
         *kind = GBTC_BACKEND_OPENCL;
+        return 0;
+    }
+    if (strcmp(name, "cuda") == 0) {
+        *kind = GBTC_BACKEND_CUDA;
         return 0;
     }
     return -1;
