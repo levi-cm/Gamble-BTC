@@ -118,6 +118,12 @@ json_number() {
     printf '%s\n' "$json" | sed -nE "s/.*\"$key\":(-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?).*/\\1/p"
 }
 
+json_string() {
+    local json="$1"
+    local key="$2"
+    printf '%s\n' "$json" | sed -nE 's/.*"'"$key"'":"([^"]*)".*/\1/p'
+}
+
 mh_from_hash_delta() {
     local hashes="$1"
     local seconds="$2"
@@ -178,6 +184,7 @@ print_hashrate_status() {
 cleanup() {
     local code=$?
     trap - EXIT INT TERM HUP
+    restore_keys
     if [[ "$cleanup_container" == "1" ]]; then
         printf '\nstopping %s...\n' "$container_name"
         docker rm -f "$container_name" >/dev/null 2>&1 || true
@@ -185,17 +192,116 @@ cleanup() {
     exit "$code"
 }
 
-monitor_container() {
-    local prev_hashes=""
-    local prev_time=""
+# Single-key monitor commands (h=hashrate now, c=connection). Active only
+# when stdin is a terminal (e.g. the kitty opened from rofi); otherwise the
+# monitor keeps its plain sleep and ignores stdin entirely.
+keys_enabled=0
+saved_stty=""
+
+setup_keys() {
+    if [[ -t 0 ]]; then
+        saved_stty="$(stty -g 2>/dev/null || true)"
+        if [[ -n "$saved_stty" ]]; then
+            stty -icanon -echo 2>/dev/null || true
+            keys_enabled=1
+        fi
+    fi
+}
+
+restore_keys() {
+    if [[ -n "$saved_stty" ]]; then
+        stty "$saved_stty" 2>/dev/null || true
+        saved_stty=""
+    fi
+    keys_enabled=0
+}
+
+mon_prev_hashes=""
+mon_prev_time=""
+
+poll_hashrate_once() {
     local json
     local now
     local lifetime_hashes
-    local sleep_pid
+    now="$(date +%s)"
+    json="$(curl -fsS --max-time 5 "$status_url" 2>/dev/null || true)"
+    if [[ -z "$json" ]]; then
+        printf '[%s] waiting for status endpoint: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$status_url"
+    else
+        print_hashrate_status "$json" "$now" "$mon_prev_hashes" "$mon_prev_time"
+        lifetime_hashes="$(json_number "$json" lifetime_hashes)"
+        if [[ "$lifetime_hashes" =~ ^[0-9]+$ ]]; then
+            mon_prev_hashes="$lifetime_hashes"
+            mon_prev_time="$now"
+        fi
+    fi
+}
+
+poll_connection_once() {
+    local json
+    local timestamp
+    local pool
+    local worker
+    local job
+    local diff
+    local accepted
+    local rejected
+    local uptime
+    local backend
+    json="$(curl -fsS --max-time 5 "$status_url" 2>/dev/null || true)"
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    if [[ -z "$json" ]]; then
+        printf '[%s] waiting for status endpoint: %s\n' "$timestamp" "$status_url"
+        return
+    fi
+    pool="$(json_string "$json" pool)"
+    worker="$(json_string "$json" worker)"
+    job="$(json_string "$json" job)"
+    diff="$(json_number "$json" diff)"
+    accepted="$(json_number "$json" accepted)"
+    rejected="$(json_number "$json" rejected)"
+    uptime="$(json_number "$json" uptime)"
+    backend="$(json_string "$json" backend)"
+    printf '[%s] conn pool=%s worker=%s job=%s diff=%s accepted=%s rejected=%s uptime=%ss backend=%s\n' \
+        "$timestamp" "${pool:-?}" "${worker:-?}" "${job:-?}" "${diff:-?}" \
+        "${accepted:-0}" "${rejected:-0}" "${uptime:-0}" "${backend:-?}"
+}
+
+handle_key() {
+    case "$1" in
+        h|H) poll_hashrate_once ;;
+        c|C) poll_connection_once ;;
+    esac
+}
+
+wait_interval() {
+    local total="$1"
+    local i
+    local key
+    if [[ "$keys_enabled" != "1" ]]; then
+        sleep "$total" &
+        local sleep_pid=$!
+        wait "$sleep_pid"
+        return
+    fi
+    for ((i = 0; i < total; i++)); do
+        if read -rsn1 -t1 key; then
+            handle_key "$key"
+        fi
+    done
+}
+
+monitor_container() {
+    mon_prev_hashes=""
+    mon_prev_time=""
 
     printf 'started %s. Status: %s\n' "$container_name" "$status_url"
     printf 'monitor interval: %ss\n' "$monitor_interval"
     printf 'container will stop when this script exits. Press Ctrl-C to stop now.\n'
+    setup_keys
+    if [[ "$keys_enabled" == "1" ]]; then
+        printf 'keys: h=hashrate now  c=connection\n'
+    fi
 
     while true; do
         if ! docker ps --format '{{.Names}}' | grep -Fxq "$container_name"; then
@@ -204,22 +310,8 @@ monitor_container() {
             return 1
         fi
 
-        now="$(date +%s)"
-        json="$(curl -fsS --max-time 5 "$status_url" 2>/dev/null || true)"
-        if [[ -z "$json" ]]; then
-            printf '[%s] waiting for status endpoint: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$status_url"
-        else
-            print_hashrate_status "$json" "$now" "$prev_hashes" "$prev_time"
-            lifetime_hashes="$(json_number "$json" lifetime_hashes)"
-            if [[ "$lifetime_hashes" =~ ^[0-9]+$ ]]; then
-                prev_hashes="$lifetime_hashes"
-                prev_time="$now"
-            fi
-        fi
-
-        sleep "$monitor_interval" &
-        sleep_pid=$!
-        wait "$sleep_pid"
+        poll_hashrate_once
+        wait_interval "$monitor_interval"
     done
 }
 

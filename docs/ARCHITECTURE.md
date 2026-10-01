@@ -11,8 +11,10 @@ preserving the original HD 4600 GLES path.
   status UI.
 - `src/sha256.*`: reusable SHA-256/SHA-256d helpers used by deterministic tests
   and future work-construction cleanup.
-- `src/backend.*`: shared backend types, backend-name parsing, and unavailable
-  placeholders for future Vulkan/OpenCL iGPU backends.
+- `src/backend.*`: shared backend types, backend-name parsing, and an
+  unavailable placeholder for a future Vulkan iGPU backend.
+  The OpenCL backend lives in `src/opencl.*` (Intel NEO preferred,
+  Mesa Rusticl fallback).
 - `src/gles_tuning.*`: GLES kernel/local-size parsing and shader-source
   generation for the benchmarkable shader variants.
 - `src/bench.*`: benchmark configuration parsing and deterministic synthetic
@@ -30,8 +32,9 @@ preserving the original HD 4600 GLES path.
 2. The miner connects to the Stratum endpoint and subscribes/authorizes.
 3. Stratum jobs are converted into block-header work.
 4. Host-side helper code prepares midstate and merkle data.
-5. Backend selection probes `vulkan`, `gles`, then `opencl`; only GLES is
-   implemented in the current code.
+5. Backend selection probes `vulkan`, `gles`, then `opencl`; `opencl`
+   (Intel NEO preferred) is the default on Iris Xe, `gles` remains the
+   compatibility backend.
 6. A selected GLES compute shader variant searches nonce batches on the iGPU.
 7. Matching nonces are submitted back to the pool.
 8. Runtime stats, backend, and device fields are exposed through `/status.json`

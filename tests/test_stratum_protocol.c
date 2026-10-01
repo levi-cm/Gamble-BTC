@@ -194,6 +194,94 @@ static void test_auth_and_share_responses(void)
                         2, &accepted, reason, sizeof(reason)));
 }
 
+typedef struct {
+    const char *const *lines;
+    size_t line_count;
+    size_t next_line;
+    size_t notification_count;
+    char notification_methods[2][32];
+} stratum_response_fixture_t;
+
+static const char *stratum_fixture_read_line(void *context)
+{
+    stratum_response_fixture_t *fixture = context;
+    if (fixture->next_line >= fixture->line_count) return NULL;
+    return fixture->lines[fixture->next_line++];
+}
+
+static void stratum_fixture_handle_notification(void *context, const char *json,
+                                                const char *method)
+{
+    stratum_response_fixture_t *fixture = context;
+    (void)json;
+    if (fixture->notification_count < 2u) {
+        snprintf(fixture->notification_methods[fixture->notification_count],
+                 sizeof(fixture->notification_methods[0]), "%s", method);
+    }
+    fixture->notification_count++;
+}
+
+static void test_auth_wait_skips_notifications(void)
+{
+    static const char *const lines[] = {
+        "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[4096]}",
+        "{\"method\":\"mining.notify\",\"params\":["
+        "\"job-1\","
+        "\"0000000000000000000000000000000000000000000000000000000000000000\","
+        "\"0102\",\"0304\",[],\"20000000\",\"1d00ffff\",\"495fab29\",true]}",
+        "{\"id\":2,\"result\":true,\"error\":null}",
+    };
+    stratum_response_fixture_t fixture = {
+        .lines = lines,
+        .line_count = sizeof(lines) / sizeof(lines[0]),
+    };
+    bool accepted = false;
+    char reason[256] = "";
+
+    expect_ok("auth-after-notifications",
+              gbtc_stratum_wait_boolean_response(
+                  2, stratum_fixture_read_line, stratum_fixture_handle_notification,
+                  &fixture, &accepted, reason, sizeof(reason)), reason);
+    expect_true("auth-after-notifications-accepted", accepted);
+    expect_true("auth-notifications-dispatched", fixture.notification_count == 2u);
+    expect_true("auth-first-notification",
+                strcmp(fixture.notification_methods[0], "mining.set_difficulty") == 0);
+    expect_true("auth-second-notification",
+                strcmp(fixture.notification_methods[1], "mining.notify") == 0);
+}
+
+static void test_subscribe_wait_skips_notifications(void)
+{
+    static const char *const lines[] = {
+        "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[4096]}",
+        "{\"method\":\"mining.notify\",\"params\":["
+        "\"job-1\","
+        "\"0000000000000000000000000000000000000000000000000000000000000000\","
+        "\"0102\",\"0304\",[],\"20000000\",\"1d00ffff\",\"495fab29\",true]}",
+        "{\"id\":1,\"result\":[[],\"a1b2c3d4\",4],\"error\":null}",
+    };
+    stratum_response_fixture_t fixture = {
+        .lines = lines,
+        .line_count = sizeof(lines) / sizeof(lines[0]),
+    };
+    gbtc_stratum_subscription_t subscription = {0};
+    char reason[256] = "";
+
+    expect_ok("subscribe-after-notifications",
+              gbtc_stratum_wait_subscribe_response(
+                  1, stratum_fixture_read_line,
+                  stratum_fixture_handle_notification, &fixture,
+                  &subscription, reason, sizeof(reason)), reason);
+    expect_true("subscribe-after-notifications-extranonce",
+                strcmp(subscription.extranonce1, "a1b2c3d4") == 0);
+    expect_true("subscribe-notifications-dispatched",
+                fixture.notification_count == 2u);
+    expect_true("subscribe-first-notification",
+                strcmp(fixture.notification_methods[0], "mining.set_difficulty") == 0);
+    expect_true("subscribe-second-notification",
+                strcmp(fixture.notification_methods[1], "mining.notify") == 0);
+}
+
 static void test_difficulty_and_notify_messages(void)
 {
     char reason[256] = "";
@@ -267,6 +355,8 @@ int main(void)
     test_difficulty_targets_and_full_compare();
     test_subscribe_validation();
     test_auth_and_share_responses();
+    test_subscribe_wait_skips_notifications();
+    test_auth_wait_skips_notifications();
     test_difficulty_and_notify_messages();
     test_json_escaping();
     return failures ? 1 : 0;

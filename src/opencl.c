@@ -191,6 +191,7 @@ const char *gbtc_opencl_kernel_name(void)
     switch (g_cfg.kernel) {
     case GBTC_OCL_KERNEL_LOOPED: return "ocl-looped";
     case GBTC_OCL_KERNEL_DUAL: return "ocl-dual";
+    case GBTC_OCL_KERNEL_PRE3: return "ocl-pre3";
     case GBTC_OCL_KERNEL_UNROLLED:
     default: return "ocl-unrolled";
     }
@@ -219,6 +220,7 @@ static int opencl_parse_kernel(const char *value, gbtc_ocl_kernel_t *out)
     if (strcmp(value, "unrolled") == 0) { *out = GBTC_OCL_KERNEL_UNROLLED; return 0; }
     if (strcmp(value, "looped") == 0) { *out = GBTC_OCL_KERNEL_LOOPED; return 0; }
     if (strcmp(value, "dual") == 0) { *out = GBTC_OCL_KERNEL_DUAL; return 0; }
+    if (strcmp(value, "pre3") == 0) { *out = GBTC_OCL_KERNEL_PRE3; return 0; }
     return -1;
 }
 
@@ -285,7 +287,7 @@ int gbtc_opencl_config_from_env(gbtc_opencl_config_t *cfg, char *reason, size_t 
         if (opencl_parse_kernel(value, &cfg->kernel) != 0) {
             if (reason && reason_cap) {
                 snprintf(reason, reason_cap,
-                         "GBTC_OPENCL_KERNEL must be unrolled, looped, or dual");
+                         "GBTC_OPENCL_KERNEL must be unrolled, looped, dual, or pre3");
             }
             return -1;
         }
@@ -335,16 +337,51 @@ static const uint32_t SHA_K[64] = {
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
 };
 
-// Emit the 64-round compression for one block using rotating variable names.
-// After 64 rounds (a multiple of 8) the working variables are back in their
-// original name order and hold the resulting digest words.
-static void emit_unrolled_block(sb_t *sb, const char *const vnames[8],
-                                const char *const wnames[16])
+static uint32_t pre_rotr(uint32_t x, unsigned n)
+{
+    return (x >> n) | (x << (32u - n));
+}
+
+// Host-side job-level precompute: the first 3 compression rounds of the
+// header-final block. Rounds 0..2 consume only W0..W2 (tail3, job-fixed), so
+// the result S3 is nonce-independent. The ORIGINAL midstate is still needed
+// separately for the feed-forward step; S3 is not a replacement for it.
+// Recomputed per batch for simplicity (3 rounds vs an ~88 ms GPU batch);
+// it is invariant across nonce_base within a job sweep.
+static void sha_prefix3(uint32_t out[8], const uint32_t mid[8],
+                        const uint32_t tail3[3])
+{
+    uint32_t a = mid[0], b = mid[1], c = mid[2], d = mid[3];
+    uint32_t e = mid[4], f = mid[5], g = mid[6], h = mid[7];
+    for (int t = 0; t < 3; t++) {
+        uint32_t s1 = pre_rotr(e, 6) ^ pre_rotr(e, 11) ^ pre_rotr(e, 25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + s1 + ch + SHA_K[t] + tail3[t];
+        uint32_t s0 = pre_rotr(a, 2) ^ pre_rotr(a, 13) ^ pre_rotr(a, 22);
+        uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = s0 + mj;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    out[0] = a; out[1] = b; out[2] = c; out[3] = d;
+    out[4] = e; out[5] = f; out[6] = g; out[7] = h;
+}
+
+// Emit compression rounds [t_first, t_first + t_count) for one block using
+// rotating variable names. Each round right-rotates the name ring by one; on
+// return slot_names[i] names the variable holding the i-th state word
+// (a..h) after the last emitted round. Callers needing only e pass a
+// non-NULL e_name_out instead.
+static void emit_unrolled_rounds(sb_t *sb, const char *const vnames[8],
+                                 const char *const wnames[16],
+                                 int t_first, int t_count,
+                                 const char **slot_names_out,
+                                 const char **e_name_out)
 {
     const char *v[8];
     for (int i = 0; i < 8; i++) v[i] = vnames[i];
 
-    for (int t = 0; t < 64; t++) {
+    for (int t = t_first; t < t_first + t_count; t++) {
         const char *wt = wnames[t & 15];
         if (t >= 16) {
             int s = t & 15, s2 = (t - 2) & 15, s7 = (t - 7) & 15, s15 = (t - 15) & 15;
@@ -363,6 +400,19 @@ static void emit_unrolled_block(sb_t *sb, const char *const vnames[8],
         v[7] = v[6]; v[6] = v[5]; v[5] = v[4]; v[4] = ne;
         v[3] = v[2]; v[2] = v[1]; v[1] = v[0]; v[0] = na;
     }
+    if (slot_names_out) {
+        for (int i = 0; i < 8; i++) slot_names_out[i] = v[i];
+    }
+    if (e_name_out) *e_name_out = v[4];
+}
+
+// Emit the 64-round compression for one block using rotating variable names.
+// After 64 rounds (a multiple of 8) the working variables are back in their
+// original name order and hold the resulting digest words.
+static void emit_unrolled_block(sb_t *sb, const char *const vnames[8],
+                                const char *const wnames[16])
+{
+    emit_unrolled_rounds(sb, vnames, wnames, 0, 64, NULL, NULL);
 }
 
 // Emit one complete SHA-256d nonce test (two compression rounds) with names
@@ -416,6 +466,57 @@ static void emit_nonce_unrolled(sb_t *sb, const char *nonce_expr, const char *sf
         "    if (idx%s < 15u) O[idx%s + 1u] = %s;\n"
         "  }\n",
         vnames[7], sfx, sfx, sfx, nonce_expr);
+}
+
+// Prefix-3 variant: the first block starts at round 3 from the host-computed
+// job-level state S3 (I[0..7]); W0..W2 still come from tail3 (I[16..18])
+// because the message expansion needs them. Feed-forward uses the ORIGINAL
+// midstate (I[8..15]), loaded after the rounds so it is not live during
+// them. Layout: S[0..7] mid[8..15] tail[16..18] target[19] noncebase[20].
+static void emit_nonce_pre3(sb_t *sb, const char *nonce_expr)
+{
+    char vn[8][12], wn[16][12];
+    const char *vnames[8], *wnames[16];
+    for (int i = 0; i < 8; i++) {
+        snprintf(vn[i], sizeof(vn[i]), "%c", "abcdefgh"[i]);
+        vnames[i] = vn[i];
+    }
+    for (int i = 0; i < 16; i++) {
+        snprintf(wn[i], sizeof(wn[i]), "w%d", i);
+        wnames[i] = wn[i];
+    }
+
+    sb_appendf(sb, "  uint w0 = I[16], w1 = I[17], w2 = I[18], w3 = %s;\n",
+               nonce_expr);
+    sb_appendf(sb, "  uint w4 = 0x80000000u");
+    for (int i = 5; i < 15; i++) sb_appendf(sb, ", w%d = 0u", i);
+    sb_appendf(sb, ", w15 = 640u;\n");
+    sb_appendf(sb, "  uint a = I[0], b = I[1], c = I[2], d = I[3];\n");
+    sb_appendf(sb, "  uint e = I[4], f = I[5], g = I[6], h = I[7];\n");
+
+    const char *slots[8] = {0};
+    emit_unrolled_rounds(sb, vnames, wnames, 3, 61, slots, NULL);
+
+    // Fold the ORIGINAL midstate into the digest, then run the second block.
+    for (int i = 0; i < 8; i++) {
+        sb_appendf(sb, "  w%d = I[%d] + %s;\n", i, 8 + i, slots[i]);
+    }
+    sb_appendf(sb, "  w8 = 0x80000000u");
+    for (int i = 9; i < 15; i++) sb_appendf(sb, ", w%d = 0u", i);
+    sb_appendf(sb, ", w15 = 256u;\n");
+    sb_appendf(sb, "  a = 0x6a09e667u; b = 0xbb67ae85u;"
+                   " c = 0x3c6ef372u; d = 0xa54ff53au;\n");
+    sb_appendf(sb, "  e = 0x510e527fu; f = 0x9b05688cu;"
+                   " g = 0x1f83d9abu; h = 0x5be0cd19u;\n");
+
+    emit_unrolled_block(sb, vnames, wnames);
+
+    sb_appendf(sb,
+        "  if (BSWAP32(0x5be0cd19u + h) <= I[19]) {\n"
+        "    uint idx = atomic_inc(O);\n"
+        "    if (idx < 15u) O[idx + 1u] = %s;\n"
+        "  }\n",
+        nonce_expr);
 }
 
 // Compact round-loop variant: far less generated code and fewer live values
@@ -521,6 +622,8 @@ char *gbtc_opencl_build_kernel_src(char *reason, size_t reason_cap)
         emit_nonce_unrolled(&sb, "I[12] + (gid << 1u) + 1u", "1");
     } else if (g_cfg.kernel == GBTC_OCL_KERNEL_LOOPED) {
         emit_nonce_looped(&sb, "I[12] + gid");
+    } else if (g_cfg.kernel == GBTC_OCL_KERNEL_PRE3) {
+        emit_nonce_pre3(&sb, "I[20] + gid");
     } else {
         emit_nonce_unrolled(&sb, "I[12] + gid", "");
     }
@@ -670,9 +773,13 @@ out:
     return rc;
 }
 
-static int opencl_probe(char *reason, size_t reason_cap)
+static size_t opencl_input_words(void)
 {
-    if (cl_load(reason, reason_cap) != 0) return -1;
+    return g_cfg.kernel == GBTC_OCL_KERNEL_PRE3 ? 24u : 16u;
+}
+
+static int opencl_probe(char *reason, size_t reason_cap)
+{    if (cl_load(reason, reason_cap) != 0) return -1;
     char saved[sizeof(g_dev_info)];
     snprintf(saved, sizeof(saved), "%s", g_dev_info);
     cl_platform_id saved_plat = g_platform;
@@ -809,7 +916,8 @@ static int opencl_init(char *reason, size_t reason_cap)
         return -1;
     }
 
-    g_buf_in = g_cl.CreateBuffer(g_ctx, CL_MEM_READ_ONLY, 16 * sizeof(cl_uint), NULL, &err);
+    g_buf_in = g_cl.CreateBuffer(g_ctx, CL_MEM_READ_ONLY,
+                                   opencl_input_words() * sizeof(cl_uint), NULL, &err);
     if (!g_buf_in || err != CL_SUCCESS) {
         set_reason(reason, reason_cap, "input buffer failed (%d)", err);
         opencl_shutdown();
@@ -839,7 +947,8 @@ static int opencl_run_batch_blocking(const gbtc_work_batch_t *work,
     // Fallback for ICDs without the event API: correct, but NEO's
     // completion wait spin-burns a CPU core.
     cl_uint zero = 0;
-    cl_int err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_in, CL_TRUE, 0, 16 * sizeof(cl_uint),
+    cl_int err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_in, CL_TRUE, 0,
+                                         opencl_input_words() * sizeof(cl_uint),
                                          in, 0, NULL, NULL);
     if (err != CL_SUCCESS) return -1;
     err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_out, CL_TRUE, 0, sizeof(zero),
@@ -882,7 +991,8 @@ static int opencl_run_batch_polled(const gbtc_work_batch_t *work,
     // sleep-poll the kernel event. The feeder thread burns ~0 CPU while the
     // iGPU works; the final blocking read returns immediately.
     cl_event ev_w0 = NULL, ev_w1 = NULL, ev_k = NULL;
-    cl_int err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_in, CL_FALSE, 0, 16 * sizeof(cl_uint),
+    cl_int err = g_cl.EnqueueWriteBuffer(g_queue, g_buf_in, CL_FALSE, 0,
+                                         opencl_input_words() * sizeof(cl_uint),
                                          in, 0, NULL, &ev_w0);
     OCL_DBG("write-in", err);
     if (err != CL_SUCCESS || !ev_w0) goto fail;
@@ -928,11 +1038,21 @@ static int opencl_run_batch(const gbtc_work_batch_t *work, gbtc_backend_result_t
     if (!work || !result || !g_kernel || work->nonce_count == 0) return -1;
     if ((work->nonce_count % gbtc_opencl_batch_quantum(&g_cfg)) != 0) return -1;
 
-    cl_uint in[16] = {0};
-    memcpy(in + 0, work->midstate, 8 * sizeof(cl_uint));
-    memcpy(in + 8, work->tail3, 3 * sizeof(cl_uint));
-    in[11] = work->target[0];
-    in[12] = work->nonce_base;
+    cl_uint in[24] = {0};
+    if (g_cfg.kernel == GBTC_OCL_KERNEL_PRE3) {
+        uint32_t s3[8];
+        sha_prefix3(s3, work->midstate, work->tail3);
+        memcpy(in + 0, s3, 8 * sizeof(cl_uint));
+        memcpy(in + 8, work->midstate, 8 * sizeof(cl_uint));
+        memcpy(in + 16, work->tail3, 3 * sizeof(cl_uint));
+        in[19] = work->target[0];
+        in[20] = work->nonce_base;
+    } else {
+        memcpy(in + 0, work->midstate, 8 * sizeof(cl_uint));
+        memcpy(in + 8, work->tail3, 3 * sizeof(cl_uint));
+        in[11] = work->target[0];
+        in[12] = work->nonce_base;
+    }
 
     cl_int err = g_cl.SetKernelArg(g_kernel, 0, sizeof(g_buf_in), &g_buf_in);
     if (err != CL_SUCCESS) return -1;

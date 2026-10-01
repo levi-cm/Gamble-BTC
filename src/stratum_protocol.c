@@ -249,6 +249,74 @@ int gbtc_parse_boolean_response(const char *json, int expected_id, bool *accepte
     return 0;
 }
 
+static int stratum_wait_response_line(gbtc_stratum_line_reader_fn read_line,
+                                      gbtc_stratum_notification_handler_fn handle_notification,
+                                      void *context, const char **response_json,
+                                      char *reason, size_t reason_cap)
+{
+    if (!read_line || !handle_notification || !response_json) {
+        set_reason(reason, reason_cap, "missing Stratum response callback or output");
+        return -1;
+    }
+
+    for (;;) {
+        const char *line = read_line(context);
+        if (!line) {
+            set_reason(reason, reason_cap, "timeout or connection closed");
+            return -1;
+        }
+
+        cJSON *root = parse_root(line, reason, reason_cap);
+        if (!root) return -1;
+
+        cJSON *method = cJSON_GetObjectItemCaseSensitive(root, "method");
+        if (cJSON_IsString(method) && method->valuestring) {
+            handle_notification(context, line, method->valuestring);
+            cJSON_Delete(root);
+            continue;
+        }
+
+        cJSON_Delete(root);
+        *response_json = line;
+        return 0;
+    }
+}
+
+int gbtc_stratum_wait_subscribe_response(int expected_id,
+                                         gbtc_stratum_line_reader_fn read_line,
+                                         gbtc_stratum_notification_handler_fn handle_notification,
+                                         void *context,
+                                         gbtc_stratum_subscription_t *subscription,
+                                         char *reason, size_t reason_cap)
+{
+    const char *response_json = NULL;
+    if (!subscription ||
+        stratum_wait_response_line(read_line, handle_notification, context,
+                                   &response_json, reason, reason_cap) != 0) {
+        if (!subscription) set_reason(reason, reason_cap, "missing Stratum subscription output");
+        return -1;
+    }
+    return gbtc_parse_subscribe_response(response_json, expected_id, subscription,
+                                         reason, reason_cap);
+}
+
+int gbtc_stratum_wait_boolean_response(int expected_id,
+                                       gbtc_stratum_line_reader_fn read_line,
+                                       gbtc_stratum_notification_handler_fn handle_notification,
+                                       void *context, bool *accepted,
+                                       char *reason, size_t reason_cap)
+{
+    const char *response_json = NULL;
+    if (!accepted ||
+        stratum_wait_response_line(read_line, handle_notification, context,
+                                   &response_json, reason, reason_cap) != 0) {
+        if (!accepted) set_reason(reason, reason_cap, "missing Stratum authorization output");
+        return -1;
+    }
+    return gbtc_parse_boolean_response(response_json, expected_id, accepted,
+                                       reason, reason_cap);
+}
+
 static int method_params(cJSON *root, const char *method_name, cJSON **params,
                          char *reason, size_t reason_cap)
 {

@@ -30,6 +30,11 @@ typedef struct {
     bool clean;
 } gbtc_stratum_job_t;
 
+typedef const char *(*gbtc_stratum_line_reader_fn)(void *context);
+typedef void (*gbtc_stratum_notification_handler_fn)(void *context,
+                                                      const char *json,
+                                                      const char *method);
+
 int gbtc_target_from_difficulty(double difficulty, uint32_t target[8],
                                 char *reason, size_t reason_cap);
 void gbtc_target_to_raw_hash(const uint32_t target[8], uint8_t raw_hash[32]);
@@ -38,8 +43,19 @@ bool gbtc_raw_hash_meets_target(const uint8_t raw_hash[32], const uint32_t targe
 int gbtc_parse_subscribe_response(const char *json, int expected_id,
                                   gbtc_stratum_subscription_t *subscription,
                                   char *reason, size_t reason_cap);
+int gbtc_stratum_wait_subscribe_response(int expected_id,
+                                         gbtc_stratum_line_reader_fn read_line,
+                                         gbtc_stratum_notification_handler_fn handle_notification,
+                                         void *context,
+                                         gbtc_stratum_subscription_t *subscription,
+                                         char *reason, size_t reason_cap);
 int gbtc_parse_boolean_response(const char *json, int expected_id, bool *accepted,
                                 char *reason, size_t reason_cap);
+int gbtc_stratum_wait_boolean_response(int expected_id,
+                                       gbtc_stratum_line_reader_fn read_line,
+                                       gbtc_stratum_notification_handler_fn handle_notification,
+                                       void *context, bool *accepted,
+                                       char *reason, size_t reason_cap);
 int gbtc_parse_set_difficulty(const char *json, double *difficulty, uint32_t target[8],
                               char *reason, size_t reason_cap);
 int gbtc_parse_notify(const char *json, gbtc_stratum_job_t *job,

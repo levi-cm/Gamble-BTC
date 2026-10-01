@@ -333,17 +333,54 @@ static int stratum_handle_notify(stratum_t *s, const char *line) {
     return 0;
 }
 
+static void stratum_handle_notification(stratum_t *s, const char *line,
+                                        const char *method) {
+    if (strcmp(method, "mining.notify") == 0) {
+        stratum_handle_notify(s, line);
+    } else if (strcmp(method, "mining.set_difficulty") == 0) {
+        double difficulty = 0;
+        uint32_t target[8];
+        char reason[256] = "";
+        if (gbtc_parse_set_difficulty(line, &difficulty, target, reason,
+                                      sizeof(reason)) == 0) {
+            s->diff = difficulty;
+            memcpy(s->target, target, sizeof(s->target));
+            s->target_generation++;
+            LOG("set_difficulty %f", s->diff);
+            pthread_mutex_lock(&m_mu);
+            g_current_diff = s->diff;
+            pthread_mutex_unlock(&m_mu);
+        } else {
+            LOG("stratum: rejected mining.set_difficulty: %s", reason);
+        }
+    } else {
+        LOG("stratum: ignored unsupported method %s", method);
+    }
+}
+
+static const char *stratum_read_handshake_line(void *context) {
+    return stratum_readline(context, 10000);
+}
+
+static void stratum_handle_handshake_notification(void *context,
+                                                  const char *line,
+                                                  const char *method) {
+    stratum_handle_notification(context, line, method);
+}
+
 static int stratum_subscribe_authorize(stratum_t *s) {
     int subscribe_id = s->next_id++;
     cJSON *subscribe_params = cJSON_CreateArray();
     if (!subscribe_params || !cJSON_AddItemToArray(subscribe_params, cJSON_CreateString("gamble-btc/0.2")) ||
         stratum_send_method(s, subscribe_id, "mining.subscribe", subscribe_params) < 0) return -1;
-    char *line = stratum_readline(s, 10000);
     gbtc_stratum_subscription_t subscription;
     char reason[256] = "";
-    if (!line || gbtc_parse_subscribe_response(line, subscribe_id, &subscription,
-                                                reason, sizeof(reason)) != 0) {
-        LOG("stratum: subscribe rejected: %s", line ? reason : "timeout or connection closed");
+    if (gbtc_stratum_wait_subscribe_response(
+            subscribe_id, stratum_read_handshake_line,
+            stratum_handle_handshake_notification, s, &subscription,
+            reason, sizeof(reason)) != 0) {
+        LOG("stratum: subscribe rejected: %s",
+            reason[0] ? reason : "invalid subscription response");
         return -1;
     }
     snprintf(s->extranonce1, sizeof(s->extranonce1), "%s", subscription.extranonce1);
@@ -357,12 +394,14 @@ static int stratum_subscribe_authorize(stratum_t *s) {
         !cJSON_AddItemToArray(authorize_params, cJSON_CreateString(s->username)) ||
         !cJSON_AddItemToArray(authorize_params, cJSON_CreateString(s->password)) ||
         stratum_send_method(s, authorize_id, "mining.authorize", authorize_params) < 0) return -1;
-    line = stratum_readline(s, 10000);
     bool authorized = false;
-    if (!line || gbtc_parse_boolean_response(line, authorize_id, &authorized,
-                                              reason, sizeof(reason)) != 0 || !authorized) {
+    reason[0] = '\0';
+    if (gbtc_stratum_wait_boolean_response(
+            authorize_id, stratum_read_handshake_line,
+            stratum_handle_handshake_notification, s, &authorized,
+            reason, sizeof(reason)) != 0 || !authorized) {
         LOG("stratum: authorization denied or malformed: %s",
-            line ? (reason[0] ? reason : "pool returned false") : "timeout or connection closed");
+            reason[0] ? reason : "pool returned false");
         return -1;
     }
     LOG("authorized as %s", s->username);
@@ -393,26 +432,7 @@ static void stratum_pump(stratum_t *s, int timeout_ms) {
     }
     cJSON *method = cJSON_GetObjectItemCaseSensitive(root, "method");
     if (cJSON_IsString(method)) {
-        if (strcmp(method->valuestring, "mining.notify") == 0) {
-            stratum_handle_notify(s, line);
-        } else if (strcmp(method->valuestring, "mining.set_difficulty") == 0) {
-            double difficulty = 0;
-            uint32_t target[8];
-            char reason[256] = "";
-            if (gbtc_parse_set_difficulty(line, &difficulty, target, reason, sizeof(reason)) == 0) {
-                s->diff = difficulty;
-                memcpy(s->target, target, sizeof(s->target));
-                s->target_generation++;
-                LOG("set_difficulty %f", s->diff);
-                pthread_mutex_lock(&m_mu);
-                g_current_diff = s->diff;
-                pthread_mutex_unlock(&m_mu);
-            } else {
-                LOG("stratum: rejected mining.set_difficulty: %s", reason);
-            }
-        } else {
-            LOG("stratum: ignored unsupported method %s", method->valuestring);
-        }
+        stratum_handle_notification(s, line, method->valuestring);
     } else {
         cJSON *id_item = cJSON_GetObjectItemCaseSensitive(root, "id");
         if (cJSON_IsNumber(id_item) && isfinite(id_item->valuedouble) &&

@@ -19,8 +19,9 @@ Support tiers:
 Current backend implementation:
 
 - `gles`: implemented and probe-tested on the current HD 4600 and Iris Xe hosts.
+- `opencl`: implemented; Intel NEO is preferred over Mesa Rusticl on this
+  laptop and is the current default (`GBTC_BACKEND=opencl`).
 - `vulkan`: probe-visible placeholder, not implemented yet.
-- `opencl`: probe-visible placeholder, not implemented yet.
 - `cpu`: intentionally not implemented; CPU nonce search is out of scope.
 
 Current HD 4600 benchmark note:
@@ -148,3 +149,27 @@ Follow-up audit toward 200 MH/s (2026-09-30):
   200 MH/s run and does not prove 200 MH/s unreachable in software. CPU usage
   was not captured in these retest JSONL records; the prior 184.022 MH/s at
   1.78% container CPU remains the low-CPU measurement recorded above.
+
+Experiment ledger toward 215 MH/s (2026-10-01):
+
+- Idea 2 (prune second-SHA rounds 61..63; filter `e_61` directly): REJECTED.
+  Derivation `h_64 = g_63 = f_62 = e_61` is correct and a `pruned` variant
+  passed full GPU conformance on NEO (all-match, zero-target, sparse
+  full-set, range-edge equality, overflow clamp, CPU reference as oracle).
+  But `igc-dump` shows the baseline binary already lacks those rounds:
+  simd16 GenISA census identical before/after (add 1110, rol 1056,
+  xor 1055, and 489, shr 164, or 125, mov 10, shl 4), `.dat` size identical
+  (43736 B), only the `-hashmovs` seed comment differs. IGC's dead-code
+  elimination already removes the unused tail, so no throughput gain is
+  possible from this change; the variant was reverted. Dumps:
+  `bench-results/igc-dump-20261001T122734Z` (baseline, `.dat`
+  `a21075fd…`, reproduces the known hash) vs `…T122741Z` (pruned, `.dat`
+  `adfa98ca…`). No A/B run was needed: instruction-identical binaries
+  cannot differ in throughput beyond noise, and benchmarking would only
+  contend with the live miner.
+- Measurement fixes (same date, kept): `bench-run.sh` now forwards
+  `GBTC_OPENCL_POLL_US`/`GBTC_OPENCL_PLATFORM`; `bench-ab.sh` samples
+  freq/PL1 every 5 s (`freq_min`, `pl1_ever`), records poll/batch/status,
+  and fails loudly instead of `wait … || true`.
+- Conformance (same date, kept): sparse full-set comparison, nonzero base,
+  `0xFFFFFFFF` edge with `<=` equality, defined overflow clamp.

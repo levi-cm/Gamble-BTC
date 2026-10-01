@@ -17,6 +17,9 @@ log="bench-results/run-${ts}.log"
 : "${GBTC_OPENCL_LOCAL_SIZE:=64}"
 : "${GBTC_OPENCL_SIMD:=auto}"
 : "${GBTC_OPENCL_KERNEL:=unrolled}"
+: "${GBTC_OPENCL_POLL_US:=1000}"
+# Optional OpenCL platform substring (e.g. rusticl); empty prefers NEO.
+: "${GBTC_OPENCL_PLATFORM:=}"
 # IGC knob (diagnostic): force a SIMD width the compiler would not pick itself.
 : "${GBTC_IGC_FORCE_SIMD:=}"
 : "${GBTC_BENCH_SECONDS:=60}"
@@ -34,6 +37,9 @@ extra_env=()
 if [[ -n "$GBTC_IGC_FORCE_SIMD" ]]; then
   extra_env+=(-e "IGC_ForceOCLSIMDWidth=${GBTC_IGC_FORCE_SIMD}")
 fi
+if [[ -n "$GBTC_OPENCL_PLATFORM" ]]; then
+  extra_env+=(-e "GBTC_OPENCL_PLATFORM=${GBTC_OPENCL_PLATFORM}")
+fi
 
 docker run --rm --network host \
   -e GBTC_BENCH_ONLY=1 \
@@ -44,6 +50,7 @@ docker run --rm --network host \
   -e GBTC_OPENCL_LOCAL_SIZE="${GBTC_OPENCL_LOCAL_SIZE}" \
   -e GBTC_OPENCL_SIMD="${GBTC_OPENCL_SIMD}" \
   -e GBTC_OPENCL_KERNEL="${GBTC_OPENCL_KERNEL}" \
+  -e GBTC_OPENCL_POLL_US="${GBTC_OPENCL_POLL_US}" \
   "${extra_env[@]}" \
   -e GBTC_BENCH_SECONDS="${GBTC_BENCH_SECONDS}" \
   -e GBTC_BENCH_WARMUP_SECONDS="${GBTC_BENCH_WARMUP_SECONDS}" \
