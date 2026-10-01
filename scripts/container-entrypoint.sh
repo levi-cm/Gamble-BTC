@@ -50,12 +50,14 @@ EOF
 
 # Compose readiness belongs to the exact selected and verified exit. Wait with
 # no hashing when both routes are unavailable. Direct Docker use can omit it.
-# Freshness window for the selected route. Missing/unparseable readiness
-# means both exits are down: stop immediately (no direct fallback). A stale
-# timestamp with the SAME exit id is verification lag (the sidecar
-# re-verifies about every 60 s; one slow curl cycle can exceed the window),
-# so tolerate a few consecutive stale reads before stopping. A fresh,
-# DIFFERENT id is a real failover/failback: stop at once so old work ends.
+# Freshness window for the selected route. A missing/unverifiable file or a
+# stale timestamp with the SAME exit id is tolerated briefly: the sidecar
+# removes readiness while it re-verifies during transitions, and one slow
+# check must not stop mining. Any observed DIFFERENT exit id (fresh or
+# stale) is a real route change: stop at once so old work ends. Persistent
+# absence (both exits down) still stops mining after a few checks; the
+# previously selected (possibly dead) exit stays set, so traffic blackholes
+# instead of routing directly.
 GBTC_ROUTE_MAX_STALE_CHECKS=3
 route_id() {
     [ -s "$GBTC_EXIT_READY_FILE" ] || return 1
@@ -112,15 +114,9 @@ while kill -0 "$miner_pid" 2>/dev/null; do
         fi
         continue
     fi
-    # Fresh-ID check failed: either the file is gone (both exits down) or
-    # the verification timestamp is stale. Missing means stop at once;
-    # a real failover to another exit also stops at once; pure staleness
-    # with the same exit is tolerated briefly.
-    if ! any_route=$(route_id_any); then
-        cleanup
-        exit 75
-    fi
-    if [ "$any_route" != "$initial_route" ]; then
+    # No fresh verification: compare against the last recorded id (even if
+    # stale) to tell a route change from a verification gap.
+    if any_route=$(route_id_any) && [ "$any_route" != "$initial_route" ]; then
         cleanup
         exit 75
     fi

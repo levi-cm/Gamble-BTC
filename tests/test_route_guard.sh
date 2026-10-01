@@ -25,7 +25,7 @@ cat > "$root/bin/sleep" <<'EOF'
 exec /bin/sleep 0.05
 EOF
 chmod 755 "$root/bin/"*
-for scenario in changed missing stale stale-transient; do
+for scenario in changed missing stale stale-transient missing-transient; do
     now=$(date +%s)
     jq -n --argjson now "$now" '{id:"primary",mullvad_verified_at:$now}' > "$root/ready.json"
     rm -f "$root/child.pid"
@@ -55,6 +55,8 @@ for scenario in changed missing stale stale-transient; do
             printf '#!/bin/sh\nexec /bin/sleep 3\n' > "$root/bin/sleep"
             chmod 755 "$root/bin/sleep"
             rm -f "$root/child.pid"
+            now=$(date +%s)
+            jq -n --argjson now "$now" '{id:"primary",mullvad_verified_at:$now}' > "$root/ready.json"
             sh /workspace/scripts/container-entrypoint.sh /usr/local/bin/miner &
             wrapper_pid=$!
             tries=0
@@ -86,6 +88,51 @@ for scenario in changed missing stale stale-transient; do
                 printf 'old mining process survived TERM\n' >&2; exit 1
             fi
             printf 'route guard: stale-transient keeps mining alive\n'
+            continue
+            ;;
+        missing-transient)
+            # A briefly removed readiness file (sidecar re-verification
+            # gap) must NOT stop mining; persistent absence still stops.
+            kill -TERM "$wrapper_pid"
+            set +e
+            wait "$wrapper_pid" >/dev/null 2>&1
+            set -e
+            wrapper_pid=
+            printf '#!/bin/sh\nexec /bin/sleep 3\n' > "$root/bin/sleep"
+            chmod 755 "$root/bin/sleep"
+            rm -f "$root/child.pid"
+            now=$(date +%s)
+            jq -n --argjson now "$now" '{id:"primary",mullvad_verified_at:$now}' > "$root/ready.json"
+            sh /workspace/scripts/container-entrypoint.sh /usr/local/bin/miner &
+            wrapper_pid=$!
+            tries=0
+            while [ ! -s "$root/child.pid" ]; do
+                /bin/sleep 0.05
+                tries=$((tries + 1)); [ "$tries" -lt 100 ]
+            done
+            child=$(cat "$root/child.pid")
+            rm "$root/ready.json"
+            # One ~3 s iteration observes the gap (strike 1 of 3).
+            /bin/sleep 5
+            if ! kill -0 "$wrapper_pid" 2>/dev/null; then
+                printf 'transient readiness gap stopped mining\n' >&2; exit 1
+            fi
+            now=$(date +%s)
+            jq -n --argjson now "$now" '{id:"primary",mullvad_verified_at:$now}' > "$root/ready.json"
+            if ! kill -0 "$child" 2>/dev/null; then
+                printf 'child died during transient gap\n' >&2; exit 1
+            fi
+            kill -TERM "$wrapper_pid"
+            set +e
+            wait "$wrapper_pid"
+            result=$?
+            set -e
+            wrapper_pid=
+            [ "$result" -eq 0 ]
+            if kill -0 "$child" 2>/dev/null; then
+                printf 'old mining process survived TERM\n' >&2; exit 1
+            fi
+            printf 'route guard: missing-transient keeps mining alive\n'
             continue
             ;;
     esac
