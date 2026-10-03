@@ -33,10 +33,14 @@
   0.21%); stretch target (≤0.5%) met. Sidecar 1.38%, thermal guard 0.15%,
   watch sampler negligible — reported separately, not divided by cores.
 - GPU 72–75 C, 1822–1835 MHz SM, 98–100% util, ~106–110 W of 120 W,
-  throttle reasons zero across all telemetry. No overclocking, power/fan
-  changes. Two transient GPU-starvation dips observed (Oct 2 ~12 min,
-  Oct 3 ~30 s, hashrate decayed then recovered; no Xid errors; suspected
-  external contention, out of campaign control).
+  throttle reasons zero across all validation windows. No overclocking,
+  power/fan changes. Two transient GPU-starvation dips observed (Oct 2
+  ~12 min, Oct 3 ~30 s, decayed then recovered; no Xid errors; suspected
+  external contention, out of campaign control). At ~17:44Z Oct 3 the card
+  would no longer hold full load below the hard limit (78–82 C, SW
+  slowdown active ~8 min, fan auto-100%, ~105 W): cooling shortfall of
+  undetermined cause. The miner was stopped and left stopped; end-state
+  is thermally safe. Delivered rates are throttle-free measurements only.
 - Correctness: OpenCL conformance (5 variants) + CUDA conformance (blocks
   64/256/512) + overflow-recovery test pass on the GTX 1060; full
   `make test` exit 0; mock pool 15/15 and 16/16 submits verified, 0 bad;
