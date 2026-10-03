@@ -15,7 +15,8 @@
   workload named in `gpu-workload.lock`. Guard PID in `guard.pid`.
 - Campaign lock: this agent owns the campaign. GPU lock: empty = no owned
   experiment workload; production `gamble-btc` service untouched.
-- Current phase: 4–16 h (Path 1). Next action: commit+push M2 (CUDA backend),
+- Campaign clock: 2026-10-01T18:30:00Z → deadline 2026-10-03T18:30:00Z. This session lost ~23 h to a stack outage (E17); no unattended 48 h run is claimed.
+- Current phase: final closeout. Miner running cuda/512 on primary, verified exit. Next action: final commit+push, handover report. No new experiments before the deadline.
   deploy cuda/256 to live mining as E06 validation (45 min: submits, CPU,
   thermals), then SASS-level arithmetic work + 60-min confirmation runs.
 
@@ -43,3 +44,4 @@
 | E16b | Reply-shape fix verification | FIXED parser: boolean result is authoritative (accepts counted regardless of error payload). Unit tests updated. E16b mock (all bool-empty): all submits result=1. Deployed image 3fe3ea70 (cuda/512). E16 CLOSED. |
 | E17 | 23 h stack outage (Oct 2 ~17:15Z -> Oct 3 16:19Z) | Miner throughput decayed 617->0.09 MH/s over ~12 min (cause undetermined, no Xid errors), then guard SIGTERM (exit 75); sidecar tailscaled died with watchdog-timeout panic (exit 1). Both containers sat Stopped 23 h (restart policy cancelled by stop; no auto-recovery; no OOM evidence). Thermal guard survived the whole gap with continuous telemetry. No 48 h unattended run can be claimed. |
 | E18 | Revival + final validation soak | Revived Oct 3 16:19Z: primary selected, fresh Mullvad verification, cuda/512 mining ~663-671 MH/s immediately. Final 65-min watch running (final-soak.csv). M9 pushed (reason logging + shape matrix; logging-only, not redeployed to avoid churning the soak). |
+| E19 | Oct 3 route flap + transient GPU dip (~17:06-17:22Z) | Control-plane empty suggestion + strikes → 2 guard restarts (correct); miner hashrate decayed 650→13 MH/s for ~30 s beforehand then recovered (no Xid; suspected external GPU contention, same signature as Oct 2). Self-recovered to 671 MH/s cold. No data hidden: final2-soak.csv shows the gap. |

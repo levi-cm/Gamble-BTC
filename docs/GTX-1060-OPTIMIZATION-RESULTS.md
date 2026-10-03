@@ -26,18 +26,22 @@
 
 ## Final (production, cuda/512 + batch 2^26)
 
-- ~662 MH/s sustained warm (E09f median 635.26 at /256; E09g/final median
-  ~662.4 at /512; cold peaks to ~671 excluded from claims).
-- Fraction of 1 GH/s goal: **~66%**. Gain over baseline: **+8.9%**.
-- Miner CPU 0.28% of one logical CPU over 60 s live (bench-loop 0.21%);
-  stretch target (≤0.5%) met. Sidecar 1.38%, thermal guard 0.15%,
+- ~660 MH/s sustained warm: E09g median 662.38 (1835 MHz), final2 median
+  657.52 (1822 MHz natural boost variation); cold peaks to ~671 excluded.
+- Fraction of 1 GH/s goal: **~66%**. Gain over baseline: **+8.6%**.
+- Miner CPU 0.28–0.29% of one logical CPU over 60 s live (bench-loop
+  0.21%); stretch target (≤0.5%) met. Sidecar 1.38%, thermal guard 0.15%,
   watch sampler negligible — reported separately, not divided by cores.
-- GPU 73–75 C, 1835 MHz SM, 99–100% util, ~108–110 W of 120 W, throttle
-  reasons zero across all telemetry. No overclocking, power/fan changes.
+- GPU 72–75 C, 1822–1835 MHz SM, 98–100% util, ~106–110 W of 120 W,
+  throttle reasons zero across all telemetry. No overclocking, power/fan
+  changes. Two transient GPU-starvation dips observed (Oct 2 ~12 min,
+  Oct 3 ~30 s, hashrate decayed then recovered; no Xid errors; suspected
+  external contention, out of campaign control).
 - Correctness: OpenCL conformance (5 variants) + CUDA conformance (blocks
   64/256/512) + overflow-recovery test pass on the GTX 1060; full
   `make test` exit 0; mock pool 15/15 and 16/16 submits verified, 0 bad;
-  1 live share submitted (pool response parsed as malformed — E16 open).
+  1 live share submitted (response shape fixed by E16 — future accepts
+  now counted).
 - Restarts: orderly route-guard restarts during primary-exit flapping
   (failover + failback verified end to end, Mullvad re-verified each time);
   hysteresis fixes absorbed single transients with zero restarts in the
