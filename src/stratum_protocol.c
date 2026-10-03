@@ -238,8 +238,10 @@ int gbtc_parse_boolean_response(const char *json, int expected_id, bool *accepte
     cJSON *root = parse_root(json, reason, reason_cap);
     if (!root) return -1;
     cJSON *result = cJSON_GetObjectItemCaseSensitive(root, "result");
-    if (response_id(root, expected_id) != 0 || !cJSON_IsBool(result) ||
-        (cJSON_IsTrue(result) && !null_error(root))) {
+    // The boolean result is authoritative; pools vary in the error payload
+    // they attach to accepts (null, [] or detail objects). A malformed
+    // result itself is still rejected.
+    if (response_id(root, expected_id) != 0 || !cJSON_IsBool(result)) {
         cJSON_Delete(root);
         set_reason(reason, reason_cap, "invalid boolean Stratum response");
         return -1;

@@ -7,8 +7,9 @@
 - Baseline image `gamble-btc:latest`
   `sha256:43ba044b973653875a3200e57189ea311a87e44671a8e79cd5736437fd2eef82`
   (also tagged `gamble-btc:rollback-vpn-20261001`, retained).
-- Final deployed image `gamble-btc:latest` `sha256:10282bf0...` (cuda/512,
-  batch 2^26, reconnect fix, overflow recovery, guard tolerance).
+- Final deployed image `gamble-btc:latest` `sha256:3fe3ea70...` (cuda/512,
+  batch 2^26, reconnect fix, overflow recovery, guard tolerance,
+  accept-counting fix).
 - **Continuity note: no unattended 48 h run is claimed.** The stack sat
   Stopped for ~23 h (Oct 2 ~17:15Z → Oct 3 16:19Z) after a sidecar
   tailscaled watchdog panic and an undiagnosed 12-minute miner throughput
@@ -75,8 +76,9 @@
 - E11 mock submit: PASS (15/15). E14 reconnect: PASS (16/16).
 - E12/E13 guard hysteresis: IMPLEMENTED, flaps absorbed, suites pass.
 - E15 cuda-512: KEEP (+3.9%). pre3: REJECT both APIs.
-- E16 ckpool response shape: OPEN (1 live submit, response rejected as
-  malformed; shape-matrix probe ready, needs a submit event or mock run).
+- E16 ckpool response shape: CLOSED. Live accept with non-null error
+  payload was miscounted as malformed; boolean result is now authoritative
+  (mock matrix + unit tests prove all shapes; E16b all-accepted).
 - E17 23 h outage: documented above; no data fabricated across the gap.
 - E18 revival + final soak: mining ~663 MH/s on primary, verified exit.
 

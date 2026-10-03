@@ -184,10 +184,18 @@ static void test_auth_and_share_responses(void)
                     gbtc_parse_boolean_response(
                         "{\"id\":2,\"result\":1,\"error\":null}",
                         2, &accepted, reason, sizeof(reason)));
-    expect_rejected("true-with-error",
-                    gbtc_parse_boolean_response(
-                        "{\"id\":2,\"result\":true,\"error\":[1,\"bad\",null]}",
-                        2, &accepted, reason, sizeof(reason)));
+    // The boolean result is authoritative; pools attach varying error
+    // payloads to accepts. A true result counts as accepted.
+    expect_ok("true-with-error",
+              gbtc_parse_boolean_response(
+                  "{\"id\":2,\"result\":true,\"error\":[1,\"bad\",null]}",
+                  2, &accepted, reason, sizeof(reason)), reason);
+    expect_true("true-with-error-value", accepted);
+    expect_ok("true-with-empty-error",
+              gbtc_parse_boolean_response(
+                  "{\"id\":2,\"result\":true,\"error\":[]}",
+                  2, &accepted, reason, sizeof(reason)), reason);
+    expect_true("true-with-empty-error-value", accepted);
     expect_rejected("wrong-response-id",
                     gbtc_parse_boolean_response(
                         "{\"id\":3,\"result\":true,\"error\":null}",
