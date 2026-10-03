@@ -457,7 +457,8 @@ static void stratum_pump(stratum_t *s, int timeout_ms) {
                 if (accepted) g_accepted++; else g_rejected++;
                 pthread_mutex_unlock(&m_mu);
             } else {
-                LOG("stratum: rejected unexpected or malformed response id=%d", id);
+                LOG("stratum: rejected response id=%d: %s", id,
+                    reason[0] ? reason : "unknown submit id");
             }
         } else {
             LOG("stratum: rejected response with invalid id");

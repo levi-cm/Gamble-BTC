@@ -10,6 +10,7 @@ Usage: mock_stratum.py <port> <seconds>   (logs JSONL verdicts to stdout)
 """
 import hashlib
 import json
+import os
 import socket
 import sys
 import threading
@@ -107,8 +108,7 @@ def handle(conn):
                     STATS["jobs_seen"].add(job_id)
                     ok = verify(job_id, en2hex, ntimehex, noncehex)
                     STATS["verified" if ok else "bad"] += 1
-                    conn.sendall((json.dumps({"id": msg["id"], "result": ok,
-                                              "error": None}) + "\n").encode())
+                    conn.sendall((json.dumps(shape_reply(msg["id"], ok, STATS["submits"])) + "\n").encode())
     except (ConnectionError, ValueError):
         pass
     finally:
@@ -143,6 +143,23 @@ srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", PORT))
 srv.listen(4)
 srv.settimeout(1.0)
+# Optional response-shape matrix for parser probing (E16): comma-separated
+# list like "bool-null,bool-empty,strid" applied per submit in order;
+# default (empty) always sends {"result":true,"error":null}.
+SHAPES = [s for s in (os.environ.get("GBTC_MOCK_SHAPES", "").split(",")) if s]
+
+
+def shape_reply(sid, ok, n):
+    shape = SHAPES[n % len(SHAPES)] if SHAPES else "bool-null"
+    if shape == "bool-null":
+        return {"id": sid, "result": ok, "error": None}
+    if shape == "bool-empty":
+        return {"id": sid, "result": ok, "error": []}
+    if shape == "strid":
+        return {"id": str(sid), "result": ok, "error": None}
+    if shape == "false-empty":
+        return {"id": sid, "result": False, "error": ["reject-reason"]}
+    return {"id": sid, "result": ok, "error": None}
 t_end = time.time() + SECONDS + 15
 print(json.dumps({"mock": "listening", "port": PORT, "seconds": SECONDS}), flush=True)
 while time.time() < t_end:
