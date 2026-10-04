@@ -16,7 +16,8 @@
 - Campaign lock: this agent owns the campaign. GPU lock: empty = no owned
   experiment workload; production `gamble-btc` service untouched.
 - Campaign clock: 2026-10-01T18:30:00Z → deadline 2026-10-03T18:30:00Z. This session lost ~23 h to a stack outage (E17); no unattended 48 h run is claimed.
-- Current phase: final closeout. Miner running cuda/512 on primary, verified exit. Next action: final commit+push, handover report. No new experiments before the deadline.
+- End-state per operator instruction: miner RUNNING (cuda/512, batch 2^26, ~662 MH/s). Resume from 37 C plateaued at 72-73 C with no new trips over 12+ min - cooling currently holds; cause of the 17:44-17:52 excursion still undetermined.
+- Thermal guard ARMED on production: `gpu-workload.lock` names `container:gamble-btc`, so a soft/hard trip stops the miner (explicit stop stays stopped under unless-stopped). Guard keeps running.
   deploy cuda/256 to live mining as E06 validation (45 min: submits, CPU,
   thermals), then SASS-level arithmetic work + 60-min confirmation runs.
 
@@ -46,3 +47,4 @@
 | E18 | Revival + final validation soak | Revived Oct 3 16:19Z: primary selected, fresh Mullvad verification, cuda/512 mining ~663-671 MH/s immediately. Final 65-min watch running (final-soak.csv). M9 pushed (reason logging + shape matrix; logging-only, not redeployed to avoid churning the soak). |
 | E19 | Oct 3 route flap + transient GPU dip (~17:06-17:22Z) | Control-plane empty suggestion + strikes → 2 guard restarts (correct); miner hashrate decayed 650→13 MH/s for ~30 s beforehand then recovered (no Xid; suspected external GPU contention, same signature as Oct 2). Self-recovered to 671 MH/s cold. No data hidden: final2-soak.csv shows the gap. |
 | E20 | Thermal trip 78–82 C with SW slowdown (~17:44–17:52Z) | HARD trip: resume from 44 C climbed to 78 C in ~85 s (normal rate) but blew through the former 73–75 C plateau to 82 C with active SW thermal slowdown (~8 min throttled). Fan auto at 100%, power normal ~105 W (not power-capped) → cooling shortfall, cause undetermined (ambient/cooler; no settings were changed). Guard tripped correctly (no lock action: production unowned by lock). Miner stopped and left STOPPED per policy — no restart into an unresolved cooling deficit. GPU cooled to 36 C. Final validated numbers stand on prior throttle-free windows; the trip is part of the record. |
+| E21 | Operator-ordered resume under armed guard | Restarted mining on the winning config with the guard lock owning the production container. Plateau 72-73 C, 662 MH/s, no trips in 12+ min. If trips recur, the guard stops the miner and it stays stopped pending cooling diagnosis. |
