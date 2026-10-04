@@ -56,10 +56,11 @@ services:
       - mesa-shader-cache:/home/miner/.cache/mesa_shader_cache
       - exit-readiness:/run/gbtc-route:ro
     # Feeder/stratum/UI threads are light; cap CPU. memlock unlimited for GPU
-    # buffer pinning.
+    # buffer pinning. Steady-state use is ~200 MiB; 512 MiB leaves 2.5x
+    # headroom for libc/TLS/log spikes.
     cpus: "4.0"
-    mem_limit: 4g
-    mem_reservation: 1g
+    mem_limit: 512m
+    mem_reservation: 256m
     ulimits:
       memlock: -1
       nofile:
