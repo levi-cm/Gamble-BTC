@@ -10,8 +10,9 @@
 - Live baseline at start: ~608 MH/s (status avg 609.08, 300 samples), GPU 72 C,
   1835 MHz, 97% util, ~104 W / 120 W limit, no thermal-slowdown flags.
 - Thermal guard: `scripts/thermal-guard.sh`, state in
-  `bench-results/campaign-20261001/`, 2 s NVML samples, soft >75 Cx3, hard 78 C
-  or any SW/HW thermal-slowdown flag, cooldown <=70 C for 60 s. Acts ONLY on the
+  bench-results/campaign-20261001/`, 2 s NVML samples, hard trip only
+  (78 C or any SW/HW thermal-slowdown flag; soft trip removed per
+  operator), cooldown <=70 C for 60 s. Acts ONLY on the
   workload named in `gpu-workload.lock`. Guard PID in `guard.pid`.
 - Campaign lock: this agent owns the campaign. GPU lock: empty = no owned
   experiment workload; production `gamble-btc` service untouched.

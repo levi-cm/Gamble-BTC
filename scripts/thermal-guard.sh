@@ -17,7 +17,6 @@ if [ ! -f "$CSV" ]; then
 fi
 : >> "$LOG"
 echo "$(date -u +%FT%TZ) guard start pid=$$" >> "$LOG"
-soft_hits=0
 cool_ok_since=0
 while true; do
   TS="$(date -u +%FT%TZ)"
@@ -45,14 +44,14 @@ while true; do
   else
     cool_ok_since=0; rm -f "$COOLDOWN_OK"
   fi
-  # trip logic
+  # Trip logic: hard limits only (no soft trip by operator choice).
+  # 78 C or any SW/HW thermal-slowdown flag stops the owned workload at
+  # once. Normal operating point is 72-75 C; the 3 C gap to the hard
+  # limit covers the ~2 s sample granularity.
   TRIP=""
   if [ "$ACTIVE_THERM" -eq 1 ]; then TRIP="HARD thermal-slowdown-active thr=$THR";
   elif [ "${TEMP%.*}" -ge 78 ] 2>/dev/null; then TRIP="HARD temp>=78C";
-  elif [ "${TEMP%.*}" -gt 75 ] 2>/dev/null; then
-    soft_hits=$((soft_hits+1))
-    if [ "$soft_hits" -ge 3 ]; then TRIP="SOFT temp>75Cx3"; fi
-  else soft_hits=0; fi
+  fi
   if [ -n "$TRIP" ]; then
     echo "$TS TRIP $TRIP temp=${TEMP}C wl=$WL" >> "$LOG"
     echo "$TS $TRIP temp=${TEMP}C wl=$WL" >> "$TRIPS"
@@ -67,7 +66,6 @@ while true; do
         *) echo "$TS unknown lock owner, no action" >> "$LOG";;
       esac
     else echo "$TS no workload lock, no action (production miner untouched)" >> "$LOG"; fi
-    soft_hits=0
     sleep 10; continue
   fi
   sleep 2
