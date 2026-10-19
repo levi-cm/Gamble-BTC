@@ -1,0 +1,15 @@
+[package]
+name = "gbtc-miner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gbtc-core = { path = "../gbtc-core" }
+gbtc-backend-vulkan = { path = "../gbtc-backend-vulkan" }
+gbtc-backend-opencl = { path = "../gbtc-backend-opencl" }
+gbtc-stratum = { path = "../gbtc-stratum" }
+gbtc-http = { path = "../gbtc-http" }
+serde_json = "1"
+signal-hook = "0.3"
+
+[dev-dependencies]

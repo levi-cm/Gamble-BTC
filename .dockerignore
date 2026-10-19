@@ -10,3 +10,6 @@ bench-results/
 miner
 core
 core.*
+
+# Never send host Rust artifacts to the container builder.
+rust/target/

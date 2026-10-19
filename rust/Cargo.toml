@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["gbtc-core", "gbtc-backend-vulkan", "gbtc-miner", "gbtc-stratum", "gbtc-http", "gbtc-backend-opencl"]

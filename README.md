@@ -1,31 +1,26 @@
 # Gamble BTC
 
-Gamble BTC is an experimental iGPU-only Bitcoin solo miner that uses an
-integrated GPU through EGL surfaceless rendering and a GLES 3.2 compute shader.
-The current container is tuned for a local Intel Iris Xe / Mesa iris setup and
-talks to a Stratum pool such as `public-pool.io`.
+Gamble BTC is an experimental iGPU-only Bitcoin solo miner. The Rust candidate
+provides Vulkan compute, a Rust OpenCL compatibility backend, Stratum and the
+local status UI. The C runtime and its Docker image remain available as references.
 
-This project is not production mining software. It is an educational prototype
-for exploring GPU compute, Bitcoin block-header hashing, Stratum work handling,
-and containerized access to Linux DRM devices.
+For the candidate build, configuration, tests and rollback commands, see
+[the Rust runtime guide](docs/RUST-RUNTIME.md) and
+[qualification results](docs/QUALIFICATION.md). The sections below describe the
+preserved C workflow unless explicitly marked Rust.
 
-## Current Status
+## Current status
 
-- Current target: Intel Iris Xe / Xe-LP class iGPU using Mesa iris.
-- Runtime shape: one C binary in a Debian-based Docker image.
-- Backend shape: `auto -> vulkan -> gles -> opencl`, with GLES implemented now
-  and Vulkan/OpenCL visible as future iGPU backend probes.
-- Control surface: HTTP status page, `/status.json`, and server-sent events on
-  port `41174`.
-- Mining mode: solo Stratum flow with the configured BTC address as username.
-- Compose file: intentionally host-specific for the original development
-  machine.
-- CPU mining is intentionally not implemented. The project exists to keep mining
-  work on the integrated GPU, where it can run with much lower CPU load than a
-  CPU miner. Host-side hashing is only used for work construction and tests.
-
-The next major scope expansion is to support the major integrated GPU families
-instead of only this one host/GPU path. See [docs/ROADMAP.md](docs/ROADMAP.md).
+- Hardware target: Intel Iris Xe / Tiger Lake integrated GPU.
+- Rust production inputs: `rust/`, `Dockerfile.rust`, `compose.rust.yaml`.
+- Explicit Rust backends: `vulkan` and `opencl`; `auto` tries them in that order.
+- HTTP UI, `/status.json` and SSE retain the original interface. The direct Rust
+  launcher uses loopback port 41176; the binary defaults 41174.
+- CPU nonce search is out of scope. Host hashes construct work and verify GPU
+  candidates.
+- 350 MH/s is a research target. It is not an established result or a consequence
+  of choosing Rust. Measured performance and remaining gates are recorded in
+  `docs/QUALIFICATION.md`.
 
 ## Safety Notes
 
@@ -200,3 +195,10 @@ distribution, then compile with the same flags used in the Dockerfile.
 ## License
 
 Gamble BTC is licensed under the MIT License. See [LICENSE](LICENSE).
+
+### Running Rust alongside XMRig
+
+The `while-xmrig` branch adds queued Vulkan dispatch, blocking fence waits and
+lower-wakeup services. Its separate image is `gamble-btc:rust-while-xmrig`; the
+launcher uses localhost port 41176. See [implementation and measurements](docs/WHILE-XMRIG.md)
+for controls, correctness checks and the four-worker coexistence runner.

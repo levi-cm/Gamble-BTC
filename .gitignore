@@ -10,6 +10,7 @@ miner
 *.a
 build/
 dist/
+rust/target/
 
 # Runtime/log output
 *.log
@@ -29,3 +30,6 @@ Thumbs.db
 # Temporary files
 tmp/
 *.tmp
+
+# Python tooling cache
+__pycache__/

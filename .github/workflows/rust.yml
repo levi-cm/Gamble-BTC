@@ -1,0 +1,37 @@
+name: Rust candidate
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shader tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc spirv-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: clippy,rustfmt
+      - name: Rust checks (GPU qualification is separate)
+        run: make test-rust
+      - name: Shell contracts
+        run: |
+          make test-scripts
+          python3 -m unittest discover -s tests -p test_bench_coexist.py
+      - name: Candidate Compose validation with synthetic configuration
+        run: |
+          printf 'BTC_ADDRESS=synthetic-ci-only\nGBTC_BACKEND=vulkan\n' > .env
+          docker compose -f compose.rust.yaml config --quiet
+      - name: Build production without C source inputs
+        run: |
+          context=$(mktemp -d)
+          cp Dockerfile.rust "$context/"
+          cp -a rust "$context/"
+          rm -rf "$context/rust/target"
+          docker build --network host -f "$context/Dockerfile.rust" -t gamble-btc:rust-ci "$context"

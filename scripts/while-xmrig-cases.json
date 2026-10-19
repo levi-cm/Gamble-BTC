@@ -1,0 +1,8 @@
+[
+  {"label":"baseline","image":"gamble-btc:rust-vulkan-candidate","kernel":"pre3","local":64,"poll":1000},
+  {"label":"candidate","image":"gamble-btc:rust-while-xmrig","kernel":"pre3","local":64,"wait_mode":"fence","wait_us":10000,"queue_ms":200},
+  {"label":"local32","image":"gamble-btc:rust-while-xmrig","kernel":"pre3","local":32,"wait_mode":"fence"},
+  {"label":"local128","image":"gamble-btc:rust-while-xmrig","kernel":"pre3","local":128,"wait_mode":"fence"},
+  {"label":"unrolled","image":"gamble-btc:rust-while-xmrig","kernel":"unrolled","local":64,"wait_mode":"fence"},
+  {"label":"pruned","image":"gamble-btc:rust-while-xmrig","kernel":"pruned","local":64,"wait_mode":"fence"}
+]

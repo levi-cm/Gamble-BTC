@@ -1,0 +1,9 @@
+[package]
+name = "gbtc-stratum"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gbtc-core = { path = "../gbtc-core" }
+serde_json = "1"
+libc = "0.2"

@@ -1,5 +1,8 @@
 # Architecture
 
+The Rust candidate architecture is documented in [RUST-RUNTIME.md](RUST-RUNTIME.md).
+The following describes the preserved C reference.
+
 Gamble BTC is built as one iGPU-only C runtime binary plus a Docker runtime
 wrapper. The source has started moving toward backend boundaries while
 preserving the original HD 4600 GLES path.

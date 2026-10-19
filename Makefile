@@ -80,3 +80,20 @@ test-scripts:
 
 clean:
 	rm -rf build miner
+
+# Rust candidate targets preserve the C reference and production image.
+.PHONY: test-rust test-rust-gpu rust-release rust-container
+test-rust:
+	cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+	cargo clippy --locked --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings
+	cargo test --locked --manifest-path rust/Cargo.toml --workspace -- --test-threads=1
+
+test-rust-gpu:
+	GBTC_REQUIRE_GPU_TESTS=1 cargo test --locked --manifest-path rust/Cargo.toml -p gbtc-backend-vulkan -- --test-threads=1 --nocapture
+	GBTC_REQUIRE_GPU_TESTS=1 cargo test --locked --manifest-path rust/Cargo.toml -p gbtc-backend-opencl -- --test-threads=1 --nocapture
+
+rust-release:
+	cargo build --release --locked --manifest-path rust/Cargo.toml -p gbtc-miner
+
+rust-container:
+	docker build --network host -f Dockerfile.rust -t gamble-btc:rust-while-xmrig .

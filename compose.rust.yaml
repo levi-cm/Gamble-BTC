@@ -1,0 +1,44 @@
+services:
+  miner-rust:
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+      target: production
+      network: host
+    image: gamble-btc:rust-while-xmrig
+    container_name: gbtc-rust-while-xmrig
+    devices:
+      - "${GBTC_DRI_RENDER:-/dev/dri/renderD128}:${GBTC_DRI_RENDER:-/dev/dri/renderD128}"
+    group_add:
+      - "${VIDEO_GID:-983}"
+      - "${RENDER_GID:-987}"
+    ports:
+      - "127.0.0.1:41176:41174"
+    env_file:
+      - .env
+    environment:
+      GBTC_BACKEND: ${GBTC_BACKEND:-vulkan}
+      GBTC_DEVICE: ${GBTC_DRI_RENDER:-/dev/dri/renderD128}
+      GBTC_HTTP_BIND: 0.0.0.0
+      GBTC_HTTP_PORT: 41174
+      GBTC_VULKAN_KERNEL: ${GBTC_VULKAN_KERNEL:-pre3}
+      GBTC_GLES_KERNEL: ""
+      GBTC_GLES_LOCAL_SIZE: ""
+      GBTC_GLES_AUTOTUNE: ""
+      GBTC_VULKAN_LOCAL_SIZE: ${GBTC_VULKAN_LOCAL_SIZE:-64}
+      GBTC_VULKAN_WAIT_MODE: ${GBTC_VULKAN_WAIT_MODE:-fence}
+      GBTC_VULKAN_WAIT_US: ${GBTC_VULKAN_WAIT_US:-10000}
+      GBTC_GPU_QUEUE_MS: ${GBTC_GPU_QUEUE_MS:-200}
+      GBTC_VULKAN_POLL_US: ${GBTC_VULKAN_POLL_US:-1000}
+      GBTC_OPENCL_POLL_US: ${GBTC_OPENCL_POLL_US:-1000}
+      GBTC_BATCH_NONCES: ${GBTC_BATCH_NONCES:-16777216}
+      MESA_SHADER_CACHE_DIR: /home/miner/.cache/mesa_shader_cache
+    volumes:
+      - rust-shader-cache:/home/miner/.cache/mesa_shader_cache
+    mem_limit: 4g
+    ulimits:
+      memlock: -1
+    stop_grace_period: 6s
+    restart: "no"
+volumes:
+  rust-shader-cache:
