@@ -94,8 +94,9 @@ energy counters. Package energy includes both miners and other host work; it
 must not be described as GPU-only energy. XMRig rates are calculated from its
 progress counter over the reported covered interval, which can be shorter than
 the enclosing five-minute BTC interval. The runtime follow-up exercises local
-Stratum, reconnects, HTTP and SSE for 330 seconds, with the first 30 excluded from
-coexistence analysis. A real wallet and public pool are unnecessary.
+Stratum, reconnects, HTTP and SSE for 330 seconds. Its full-app CPU/hash
+analysis uses the qualifier's 20-second startup grace, leaving over 300 seconds
+of sampled work; XMRig progress analysis starts after 30 seconds. A real wallet and public pool are unnecessary.
 
 Local-size and shader screens are exploratory single runs. Balanced repeated
 baseline/candidate ordering supports the host-loop comparison; a single faster
@@ -117,5 +118,106 @@ the debug image is
 `sha256:2a51cf86eb93bacca680d9e843b0f7ee1bca9cf01d0c38af8fe7400d0a9bc54d`.
 Build inputs and test logs are recorded in `/tmp/gbtc-while-xmrig/`.
 
-Sustained results are recorded after the runs complete. Lower host CPU use does not remove
-the shared package-power constraint or establish a 350 MH/s capability.
+### Sustained host-loop comparison
+
+Each BTC trial measured at least 300 seconds after 30 seconds of warmup. The
+loaded comparison used baseline/candidate/candidate/baseline ordering. CPU is
+complete-container cgroup CPU time divided by wall time, expressed as a percent
+of one core. These are synthetic rates; the local-pool follow-up is separate.
+
+| Condition | BTC MH/s | BTC CPU, % of one core | Mean actual GT MHz | XMRig H/s | Package W |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Original Rust, BTC alone | 190.57 | 1.398 | 1,165 | — | 25.47 |
+| Queued Rust, BTC alone | 190.50 | 0.296 | 1,164 | — | 24.94 |
+| Four-worker XMRig alone | — | — | — | 1,276.5 | 24.94 |
+| Original Rust + XMRig, two-run mean | 78.28 | 1.762 | 491 | 1,199.5 | 24.94 |
+| Queued Rust + XMRig, two-run mean | 78.98 | 0.388 | 493 | 1,203.1 | 24.94 |
+
+The two loaded candidate runs were 78.9846 and 78.9785 MH/s; baseline runs were
+78.6447 and 77.9067 MH/s. The approximately 0.9% higher mean BTC rate is small
+relative to uncontrolled host/clock variation and two repeats do not establish
+a general speedup. The clear improvement is 78.0% less BTC process CPU, with
+both miners retaining comparable throughput. Standalone CPU fell 78.8% while
+BTC rate differed by less than 0.04%.
+
+Main-thread voluntary context switches averaged 926.9/s before and 92.7/s after
+under XMRig, a 90.0% reduction. Standalone values were 903.6/s and 94.8/s.
+Measured queued GPU execution spans covered approximately 99.98% of synthetic
+wall time. That describes timestamped dispatch spans, including any GPU stalls;
+it is not an independent EU-utilization or silicon-maximum measurement.
+
+The queued miner retained 41.5% of its standalone BTC rate with four XMRig
+workers. XMRig retained 94.2% of its standalone rate. Shared package power remains
+the principal observed constraint: lowering host wakeups did not restore the
+standalone iGPU clock. Package energy includes both workloads; the small
+standalone power difference is a single-pair observation, not an established
+GPU efficiency improvement. No 350 MH/s capability is established.
+
+XMRig rates use progress-counter differences over the reported covered interval,
+about 270 seconds within each five-minute measurement. Raw telemetry and
+per-run reports reside in `bench-results/while-xmrig-20261019T0835Z/`.
+Run `python3 scripts/analyze-coexist.py` with that directory to regenerate the
+CPU, clock, scheduler, RAPL and GPU-span summary.
+
+
+### Kernel/local-size screens and compiler inspection
+
+Each screen measured at least five minutes with four unchanged XMRig workers.
+These are individual shared-desktop runs, not a balanced isolated comparison.
+Start-of-run process snapshots show substantial Firefox/extension activity from
+`local32` onward; both BTC and XMRig rates fell in some of these intervals.
+That workload was left untouched. These data cannot establish a clean tuning
+ranking or attribute the observed differences entirely to the shader.
+
+| Candidate variant | BTC MH/s | BTC CPU, % of one core | XMRig H/s |
+| --- | ---: | ---: | ---: |
+| pre3 / 64, earlier two-run mean | 78.98 | 0.388 | 1,203.1 |
+| pre3 / 32 | 68.49 | 0.391 | 1,031.3 |
+| pre3 / 128 | 70.82 | 0.381 | 1,052.2 |
+| unrolled / 64 | 68.45 | 0.384 | 1,037.0 |
+| pruned / 64 | 79.13 | 0.384 | 1,182.3 |
+
+After all timed workloads exited, ANV compiler dumps from the final debug image
+were captured with `INTEL_DEBUG=cs` and `MESA_SHADER_CACHE_DISABLE=true`.
+All five configurations compiled SIMD16 code using 128 GRF registers and zero
+spills/fills. The three pre3 local sizes had the same reported 3,960 instructions
+and 19,772 estimated cycles. Unrolled and pruned each reported 4,032 instructions
+and 19,856 estimated cycles. These are compiler estimates, not measured GPU cycles.
+Identical instruction statistics clearly do not explain the different shared-load
+rates. Dumps and exact probe commands are under the evidence directory's
+`compiler/` subdirectory. The existing pre3/64 default is retained.
+
+Two-nonce interleaving was not added: the current compiler already allocates 128
+GRFs per thread, so additional live state requires a separate register-pressure,
+correctness and loaded-throughput experiment. No interleaving gain is claimed.
+
+### Full runtime alongside XMRig
+
+The production image completed a 331.1-second local-pool run with four independently
+accepted shares, three connections/authorizations, eight clean and eleven nonclean
+jobs, no invalid/duplicate/stale submissions and shutdown in 0.48 seconds, exit 0.
+HTTP status requests and slow SSE clients remained active. The controller's last active
+status sample showed 3,264 retired batches, two still outstanding, zero poll checks and
+7.11 ms cumulative prepared-work wall time. This validates use of the new queue
+and cache in the actual controller, separately from the synthetic benchmark.
+
+After the existing 20-second startup grace, a 309.49-second sampled interval
+completed **78.76 MH/s** with **0.552% of one CPU core**, averaging 491 MHz.
+XMRig reported **1,185.8 H/s** over its separately covered 270.02-second progress
+interval. This is a candidate-only application-level check under the later shared
+desktop load, not a matched old/new full-runtime comparison. The same source and
+image defaults were used throughout. All task-owned miners exited afterward.
+
+The Vulkan conformance harness was additionally compiled inside the exact
+container build stage. All five embedded SPIR-V modules were byte-identical
+between that test build and the production release build. All 24 conformance
+checks passed for every shipped kernel with validation enabled in the debug
+container; pre3 also passed in legacy polling mode. Evidence is in
+`/tmp/gbtc-while-xmrig/container-conformance/`.
+
+The earlier `while-xmrig-20261019T0829Z` attempt was stopped before its first
+measured run finished, to fix legacy wait compatibility; it contributes no rate
+or acceptance result. The final input manifest SHA-256 is
+`d4933c39363710386e9318e7c8599850e52888fd2eec88976d4be8be507c8634`.
+Per-stage timings are wall times; individual stage CPU attribution is not
+provided. Other hardware, driver versions and XMRig configurations remain untested.

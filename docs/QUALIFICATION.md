@@ -84,3 +84,10 @@ are untested. The original image and launcher remain available for rollback.
 
 See [the runtime guide](RUST-RUNTIME.md) for build, probe, launch and qualification
 commands, and [the ceiling notes](CEILING.md) for bounded performance evidence.
+
+## Subsequent while-xmrig branch
+
+The 2026-10-19 implementation, 153-test qualification, container-built GPU
+conformance and sustained four-worker XMRig results are recorded in
+[WHILE-XMRIG.md](WHILE-XMRIG.md). Its image tags and launcher port are separate
+from the historical reference images listed above.

@@ -66,6 +66,24 @@ def main():
     control = args.directory / 'control.json'
     if control.exists():
         output['xmrig_alone'] = json.loads(control.read_text())
+    runtime = args.directory / 'runtime'
+    metrics = runtime / 'runtime-metrics.jsonl'
+    if metrics.exists():
+        samples = [json.loads(line) for line in metrics.read_text().splitlines()]
+        # Use the qualifier's existing 20-second startup grace for the full-app window.
+        measured = [row for row in samples if row['elapsed'] >= 20 and 'cpu_usec' in row]
+        if len(measured) >= 2:
+            a, b = measured[0], measured[-1]
+            elapsed = b['elapsed'] - a['elapsed']
+            result = dict(startup_grace_seconds=20, measured_seconds=elapsed,
+                          mh_s=(b['lifetime_hashes'] - a['lifetime_hashes']) / 1e6 / elapsed,
+                          cpu_percent_one_core=(b['cpu_usec'] - a['cpu_usec']) / 1e6 / elapsed * 100,
+                          gt_mhz_mean=mean([row.get('actual_mhz') for row in measured]))
+            runtime_xmrig = args.directory / 'runtime-xmrig.json'
+            if runtime_xmrig.exists():
+                result['xmrig'] = json.loads(runtime_xmrig.read_text())
+            output['runtime'] = result
+            (runtime / 'performance-summary.json').write_text(json.dumps(result, indent=2) + '\n')
     (args.directory / 'analysis.json').write_text(json.dumps(output, indent=2) + '\n')
     print(json.dumps(output, indent=2))
 

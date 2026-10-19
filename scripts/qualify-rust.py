@@ -247,10 +247,15 @@ def main():
                                     ['docker', 'inspect', '--format', '{{.State.Pid}}', container], text=True))
                             else:
                                 miner_pid = proc.pid
-                            group = pathlib.Path('/proc', str(miner_pid), 'cgroup').read_text().strip().split('::', 1)[1]
-                            cpu_stat = pathlib.Path('/sys/fs/cgroup' + group, 'cpu.stat')
-                        usage = dict(line.split() for line in cpu_stat.read_text().splitlines())
-                        metric['cpu_usec'] = int(usage['usage_usec'])
+                            if args.image:
+                                group = pathlib.Path('/proc', str(miner_pid), 'cgroup').read_text().strip().split('::', 1)[1]
+                                cpu_stat = pathlib.Path('/sys/fs/cgroup' + group, 'cpu.stat')
+                        if args.image:
+                            usage = dict(line.split() for line in cpu_stat.read_text().splitlines())
+                            metric['cpu_usec'] = int(usage['usage_usec'])
+                        else:
+                            fields = pathlib.Path('/proc', str(miner_pid), 'stat').read_text().rsplit(') ', 1)[1].split()
+                            metric['cpu_usec'] = (int(fields[11]) + int(fields[12])) * 1_000_000 / os.sysconf('SC_CLK_TCK')
                         metric['actual_mhz'] = int(pathlib.Path('/sys/class/drm/card1/gt_act_freq_mhz').read_text())
                     except (OSError, ValueError, KeyError):
                         pass
